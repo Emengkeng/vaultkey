@@ -24,6 +24,9 @@ import (
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
 	"github.com/vaultkey/vaultkey/internal/worker"
+	"google.golang.org/api/option"
+
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
 )
 
 func main() {
@@ -32,19 +35,25 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// ── KMS ──────────────────────────────────────────────────
+	kmsBackend, err := buildKMS(ctx, cfg)
+	if err != nil {
+		log.Fatalf("init kms: %v", err)
+	}
+	if err := kmsBackend.Health(ctx); err != nil {
+		log.Fatalf("kms health check failed: %v", err)
+	}
+	log.Printf("kms: connected (provider=%s)", cfg.KMS.Provider)
+
 	// ── Storage ──────────────────────────────────────────────
 	store, err := storage.New(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("connect db: %v", err)
 	}
 	defer store.Close()
-
-	// ── KMS (Vault) ──────────────────────────────────────────
-	vaultKMS := internalkms.NewVault(cfg.Vault.Addr, cfg.Vault.Token, cfg.Vault.MountPath, cfg.Vault.KeyName)
-	if err := vaultKMS.Health(context.Background()); err != nil {
-		log.Fatalf("vault health check failed: %v\nensure Vault is running and unsealed", err)
-	}
-	log.Println("vault: connected")
 
 	// ── Redis + Queue ────────────────────────────────────────
 	q, err := queue.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
@@ -64,15 +73,12 @@ func main() {
 	nonceMgr := nonce.New(redisClient)
 
 	// ── Services ─────────────────────────────────────────────
-	walletSvc := wallet.NewService(vaultKMS)
+	walletSvc := wallet.NewService(kmsBackend)
 	rpcMgr := rpc.NewManager(cfg.RPC.EVMEndpoints, cfg.RPC.SolanaEndpoint)
 	webhookSvc := webhook.New()
 	relayerSvc := relayer.New(store, walletSvc, rpcMgr, nonceMgr)
 
 	// ── Worker Pool ──────────────────────────────────────────
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	w := worker.New(
 		store,
 		q,
@@ -96,14 +102,11 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Public
 	mux.HandleFunc("POST /projects", h.CreateProject)
-	mux.HandleFunc("GET /health", healthHandler(vaultKMS, q))
+	mux.HandleFunc("GET /health", healthHandler(kmsBackend, q))
 
-	// Authenticated
 	mux.Handle("PATCH /project/webhook", authed(http.HandlerFunc(h.UpdateWebhook)))
 
-	// Relayer wallet management
 	mux.Handle("POST /projects/relayer", authed(http.HandlerFunc(relayerH.RegisterRelayer)))
 	mux.Handle("GET /projects/relayer", authed(http.HandlerFunc(relayerH.GetRelayerInfo)))
 	mux.Handle("GET /projects/relayers", authed(http.HandlerFunc(relayerH.ListRelayers)))
@@ -144,7 +147,6 @@ func main() {
 
 	<-quit
 	log.Println("shutting down...")
-
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -157,20 +159,48 @@ func main() {
 	log.Println("stopped")
 }
 
+// buildKMS constructs the correct KMS backend based on KMS_PROVIDER.
+func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) {
+	switch cfg.KMS.Provider {
+	case "vault":
+		return internalkms.NewVault(
+			cfg.Vault.Addr,
+			cfg.Vault.Token,
+			cfg.Vault.MountPath,
+			cfg.Vault.KeyName,
+		), nil
+
+	case "gcp":
+		var opts []option.ClientOption
+		if cfg.GCP.CredentialsFile != "" {
+			opts = append(opts, option.WithCredentialsFile(cfg.GCP.CredentialsFile))
+		}
+		return internalkms.NewGCP(ctx, cfg.GCP.KeyName, opts...)
+
+	case "aws":
+		return internalkms.NewAWS(ctx, cfg.AWS.KeyID,
+			awscfg.WithRegion(cfg.AWS.Region),
+		)
+
+	default:
+		return nil, fmt.Errorf("unknown KMS provider: %s", cfg.KMS.Provider)
+	}
+}
+
 func healthHandler(kms internalkms.KMS, q *queue.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		vaultErr := kms.Health(r.Context())
+		kmsErr := kms.Health(r.Context())
 		redisErr := q.Health(r.Context())
 
-		if vaultErr != nil || redisErr != nil {
+		if kmsErr != nil || redisErr != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"vault":"%v","redis":"%v"}`,
-			healthStr(vaultErr), healthStr(redisErr))
+		fmt.Fprintf(w, `{"kms":"%v","redis":"%v"}`,
+			healthStr(kmsErr), healthStr(redisErr))
 	}
 }
 

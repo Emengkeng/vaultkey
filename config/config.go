@@ -10,10 +10,19 @@ import (
 type Config struct {
 	Port        string
 	DatabaseURL string
+	KMS         KMSConfig
 	Vault       VaultConfig
+	GCP         GCPConfig
+	AWS         AWSConfig
 	Redis       RedisConfig
 	Worker      WorkerConfig
 	RPC         RPCConfig
+}
+
+// KMSConfig controls which KMS backend is active.
+// Provider values: "vault" (default), "gcp", "aws"
+type KMSConfig struct {
+	Provider string
 }
 
 type VaultConfig struct {
@@ -21,6 +30,21 @@ type VaultConfig struct {
 	Token     string
 	MountPath string
 	KeyName   string
+}
+
+// GCPConfig holds configuration for Google Cloud KMS.
+// KeyName is the full resource name:
+// projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
+type GCPConfig struct {
+	KeyName                    string
+	CredentialsFile            string // path to service account JSON, empty = ADC
+}
+
+// AWSConfig holds configuration for AWS KMS.
+// KeyID accepts key ID, key ARN, alias name, or alias ARN.
+type AWSConfig struct {
+	KeyID  string
+	Region string
 }
 
 type RedisConfig struct {
@@ -40,27 +64,13 @@ type RPCConfig struct {
 }
 
 func Load() (*Config, error) {
-	// Vault token loading: prefer file over direct env var
-	vaultToken := os.Getenv("VAULT_TOKEN")
-	if vaultTokenFile := os.Getenv("VAULT_TOKEN_FILE"); vaultTokenFile != "" {
-		tokenBytes, err := os.ReadFile(vaultTokenFile)
-		if err != nil {
-			return nil, fmt.Errorf("read vault token file %s: %w", vaultTokenFile, err)
-		}
-		vaultToken = strings.TrimSpace(string(tokenBytes))
-	}
-	if vaultToken == "" {
-		return nil, fmt.Errorf("VAULT_TOKEN or VAULT_TOKEN_FILE must be set")
-	}
+	provider := getEnv("KMS_PROVIDER", "vault")
 
 	cfg := &Config{
 		Port:        getEnv("PORT", "8080"),
 		DatabaseURL: requireEnv("DATABASE_URL"),
-		Vault: VaultConfig{
-			Addr:      getEnv("VAULT_ADDR", "http://vault:8200"),
-			Token:     vaultToken,
-			MountPath: getEnv("VAULT_MOUNT_PATH", "transit"),
-			KeyName:   getEnv("VAULT_KEY_NAME", "vaultkey-master"),
+		KMS: KMSConfig{
+			Provider: provider,
 		},
 		Redis: RedisConfig{
 			Addr:     getEnv("REDIS_ADDR", "redis:6379"),
@@ -77,33 +87,69 @@ func Load() (*Config, error) {
 		},
 	}
 
+	switch provider {
+	case "vault":
+		vaultToken := os.Getenv("VAULT_TOKEN")
+		if vaultTokenFile := os.Getenv("VAULT_TOKEN_FILE"); vaultTokenFile != "" {
+			tokenBytes, err := os.ReadFile(vaultTokenFile)
+			if err != nil {
+				return nil, fmt.Errorf("read vault token file %s: %w", vaultTokenFile, err)
+			}
+			vaultToken = strings.TrimSpace(string(tokenBytes))
+		}
+		if vaultToken == "" {
+			return nil, fmt.Errorf("KMS_PROVIDER=vault requires VAULT_TOKEN or VAULT_TOKEN_FILE")
+		}
+		cfg.Vault = VaultConfig{
+			Addr:      getEnv("VAULT_ADDR", "http://vault:8200"),
+			Token:     vaultToken,
+			MountPath: getEnv("VAULT_MOUNT_PATH", "transit"),
+			KeyName:   getEnv("VAULT_KEY_NAME", "vaultkey-master"),
+		}
+
+	case "gcp":
+		keyName := os.Getenv("GCP_KMS_KEY_NAME")
+		if keyName == "" {
+			return nil, fmt.Errorf("KMS_PROVIDER=gcp requires GCP_KMS_KEY_NAME")
+		}
+		cfg.GCP = GCPConfig{
+			KeyName:         keyName,
+			CredentialsFile: getEnv("GOOGLE_APPLICATION_CREDENTIALS", ""),
+		}
+
+	case "aws":
+		keyID := os.Getenv("AWS_KMS_KEY_ID")
+		if keyID == "" {
+			return nil, fmt.Errorf("KMS_PROVIDER=aws requires AWS_KMS_KEY_ID")
+		}
+		cfg.AWS = AWSConfig{
+			KeyID:  keyID,
+			Region: getEnv("AWS_REGION", "us-east-1"),
+		}
+
+	default:
+		return nil, fmt.Errorf("unknown KMS_PROVIDER %q — valid values: vault, gcp, aws", provider)
+	}
+
 	return cfg, nil
 }
 
-// loadEVMEndpoints dynamically loads all EVM_RPC_{CHAIN_ID} environment variables
-// This supports both mainnet and testnet configurations without code changes
 func loadEVMEndpoints() map[string]string {
 	endpoints := make(map[string]string)
-	
-	// Load from environment - any variable matching EVM_RPC_* pattern
+
 	for _, env := range os.Environ() {
 		if strings.HasPrefix(env, "EVM_RPC_") {
 			parts := strings.SplitN(env, "=", 2)
 			if len(parts) != 2 {
 				continue
 			}
-			key := parts[0]
-			value := parts[1]
-			
-			// Extract chain ID from EVM_RPC_{CHAIN_ID}
-			chainID := strings.TrimPrefix(key, "EVM_RPC_")
-			if chainID != "" && value != "" {
-				endpoints[chainID] = value
+			chainID := strings.TrimPrefix(parts[0], "EVM_RPC_")
+			if chainID != "" && parts[1] != "" {
+				endpoints[chainID] = parts[1]
 			}
 		}
 	}
-	
-	// Fallback defaults for mainnet if nothing configured
+
 	if len(endpoints) == 0 {
 		endpoints = map[string]string{
 			"1":     "https://cloudflare-eth.com",
@@ -113,7 +159,7 @@ func loadEVMEndpoints() map[string]string {
 			"10":    "https://mainnet.optimism.io",
 		}
 	}
-	
+
 	return endpoints
 }
 
