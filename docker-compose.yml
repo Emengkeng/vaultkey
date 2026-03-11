@@ -1,0 +1,137 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vaultkey
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: vaultkey
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultkey"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redischangeme}
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    # Redis port NOT mapped to host - internal only
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redischangeme}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  vault:
+    image: hashicorp/vault:1.15
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_LOCAL_CONFIG: |
+        {
+          "storage": {"file": {"path": "/vault/data"}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true}}],
+          "default_lease_ttl": "168h",
+          "max_lease_ttl": "720h",
+          "ui": false
+        }
+    volumes:
+      - vault_data:/vault/data
+      - ./scripts:/scripts:ro
+    networks:
+      - internal
+    # Vault port NOT mapped to host
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  vault-init:
+    image: curlimages/curl:latest
+    restart: on-failure
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_MOUNT_PATH: transit
+      VAULT_KEY_NAME: vaultkey-master
+    volumes:
+      - vault_data:/vault/data
+      - ./scripts:/scripts:ro
+    entrypoint: ["sh", "/scripts/vault-init.sh"]
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://vaultkey:${POSTGRES_PASSWORD:-changeme}@postgres:5432/vaultkey?sslmode=disable
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN_FILE: /vault/data/root_token
+      VAULT_MOUNT_PATH: transit
+      VAULT_KEY_NAME: vaultkey-master
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redischangeme}
+
+      # Worker config
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      WORKER_POLL_TIMEOUT_SEC: 5
+
+      # EVM RPC endpoints
+      EVM_RPC_1: ${EVM_RPC_1:-https://cloudflare-eth.com}
+      EVM_RPC_137: ${EVM_RPC_137:-https://polygon-rpc.com}
+      EVM_RPC_42161: ${EVM_RPC_42161:-https://arb1.arbitrum.io/rpc}
+      EVM_RPC_8453: ${EVM_RPC_8453:-https://mainnet.base.org}
+      EVM_RPC_10: ${EVM_RPC_10:-https://mainnet.optimism.io}
+
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+    ports:
+      - "8080:8080"
+    volumes:
+      - vault_data:/vault/data:ro
+    networks:
+      - internal
+      - external
+
+networks:
+  internal:
+    internal: true   # Vault, Redis, Postgres unreachable from outside
+  external:
+    internal: false  # Only the API is exposed
+
+volumes:
+  postgres_data:
+  redis_data:
+  vault_data:
