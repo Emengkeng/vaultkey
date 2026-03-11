@@ -1,0 +1,77 @@
+name: Bug Report
+description: Report a bug in VaultKey
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear description of the bug
+      placeholder: "When I call POST /wallets with chain_type=evm, I get..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Start VaultKey with `docker compose up`
+        2. Call `POST /wallets` with payload {...}
+        3. Observe error response
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should happen?
+      placeholder: "Should return 201 with wallet_id"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happens?
+      placeholder: "Returns 500 with error: ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your setup
+      value: |
+        - VaultKey version: 
+        - OS: 
+        - Go version: 
+        - Docker version: 
+        - Deployment: (docker-compose / kubernetes / bare metal)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant logs (redact sensitive data!)
+      render: shell
+      placeholder: |
+        ERROR: failed to decrypt wallet key: vault token expired
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Screenshots, related issues, etc.
