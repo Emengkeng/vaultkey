@@ -363,3 +363,6 @@ func (s *Store) DeactivateRelayerWallet(ctx context.Context, projectID, relayerI
 	)
 	return err
 }
+
+// DB returns the underlying *sql.DB. Use only in tests.
+func (s *Store) DB() *sql.DB { return s.db }
