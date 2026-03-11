@@ -347,7 +347,6 @@ POST /wallets/{walletId}/sign/transaction/evm
     "data": "0x",
     "gas_limit": 21000,
     "gas_price": "0x3B9ACA00",
-    "nonce": 0,
     "chain_id": 1
   }
 }
@@ -363,7 +362,6 @@ POST /wallets/{walletId}/sign/transaction/evm
 | `payload.data` | string | No | Contract call data (hex string) |
 | `payload.gas_limit` | integer | Yes* | Gas limit (*Not required for gasless) |
 | `payload.gas_price` | string | Yes* | Gas price in wei (hex string, *Not required for gasless) |
-| `payload.nonce` | integer | Yes* | Transaction nonce (*Not required for gasless) |
 | `payload.chain_id` | integer | Yes | Chain ID (1=Ethereum, 137=Polygon, etc.) |
 
 **Chain IDs:**
@@ -397,7 +395,6 @@ curl -X POST http://localhost:8080/wallets/wallet_xyz789/sign/transaction/evm \
       "data": "0x",
       "gas_limit": 21000,
       "gas_price": "0x3B9ACA00",
-      "nonce": 0,
       "chain_id": 1
     }
   }'
@@ -1139,7 +1136,6 @@ async function main() {
       data: '0x',
       gas_limit: 21000,
       gas_price: '0x3B9ACA00',
-      nonce: 0,
       chain_id: 1
     }
   });
@@ -1347,7 +1343,7 @@ async function retryRequest(fn, maxRetries = 3) {
 1. **Use idempotency keys**
    - Prevents duplicate jobs on retry
    - Safe to retry failed requests
-   - Format: `{operation}_{user_id}_{timestamp}_{nonce}`
+   - Format: `{operation}_{user_id}_{timestamp}`
 
 2. **Don't poll aggressively**
    - Wait 1-2 seconds between polls
