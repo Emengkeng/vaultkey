@@ -209,4 +209,4 @@ Horizontal scaling: run multiple API + worker instances pointing at the same Pos
 For the cloud/managed option: replace Vault with AWS KMS or GCP KMS (same interface, swap the adapter). Use customer-managed KMS keys so the operator, not VaultKey, controls the root of trust.
 
 ## License
-
+GNU
