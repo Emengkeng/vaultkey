@@ -54,26 +54,36 @@ func main() {
 	defer q.Close()
 	log.Println("redis: connected")
 
-	// ── Rate Limiter ─────────────────────────────────────────
+	// ── Shared Redis client (rate limiter + nonce manager) ───
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
 		Password: cfg.Redis.Password,
 		DB:       cfg.Redis.DB,
 	})
 	limiter := ratelimit.New(redisClient)
+	nonceMgr := nonce.New(redisClient)
 
 	// ── Services ─────────────────────────────────────────────
 	walletSvc := wallet.NewService(vaultKMS)
 	rpcMgr := rpc.NewManager(cfg.RPC.EVMEndpoints, cfg.RPC.SolanaEndpoint)
 	webhookSvc := webhook.New()
-	nonceMgr := nonce.New(redisClient)
 	relayerSvc := relayer.New(store, walletSvc, rpcMgr, nonceMgr)
 
 	// ── Worker Pool ──────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := worker.New(store, q, walletSvc, relayerSvc, webhookSvc, cfg.Worker.Concurrency, cfg.Worker.PollTimeoutSec)
+	w := worker.New(
+		store,
+		q,
+		walletSvc,
+		relayerSvc,
+		webhookSvc,
+		nonceMgr,
+		rpcMgr,
+		cfg.Worker.Concurrency,
+		cfg.Worker.PollTimeoutSec,
+	)
 	go func() {
 		log.Printf("worker: starting %d workers", cfg.Worker.Concurrency)
 		w.Start(ctx)
@@ -103,16 +113,13 @@ func main() {
 	mux.Handle("GET /wallets/{walletId}", authed(http.HandlerFunc(h.GetWallet)))
 	mux.Handle("GET /users/{userId}/wallets", authed(http.HandlerFunc(h.ListUserWallets)))
 
-	// Async signing - returns job_id immediately
 	mux.Handle("POST /wallets/{walletId}/sign/transaction/evm", authed(http.HandlerFunc(h.SubmitSignEVMTransaction)))
 	mux.Handle("POST /wallets/{walletId}/sign/message/evm", authed(http.HandlerFunc(h.SubmitSignEVMMessage)))
 	mux.Handle("POST /wallets/{walletId}/sign/transaction/solana", authed(http.HandlerFunc(h.SubmitSignSolanaTransaction)))
 	mux.Handle("POST /wallets/{walletId}/sign/message/solana", authed(http.HandlerFunc(h.SubmitSignSolanaMessage)))
 
-	// Job status polling (dev can poll while waiting for webhook)
 	mux.Handle("GET /jobs/{jobId}", authed(http.HandlerFunc(h.GetJob)))
 
-	// Balance + broadcast
 	mux.Handle("GET /wallets/{walletId}/balance", authed(http.HandlerFunc(h.GetBalance)))
 	mux.Handle("POST /wallets/{walletId}/broadcast", authed(http.HandlerFunc(h.Broadcast)))
 
@@ -138,7 +145,7 @@ func main() {
 	<-quit
 	log.Println("shutting down...")
 
-	cancel() // stop workers
+	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()

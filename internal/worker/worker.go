@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vaultkey/vaultkey/internal/nonce"
 	"github.com/vaultkey/vaultkey/internal/queue"
 	"github.com/vaultkey/vaultkey/internal/relayer"
+	"github.com/vaultkey/vaultkey/internal/rpc"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
@@ -21,6 +23,8 @@ type Worker struct {
 	walletSvc   *wallet.Service
 	relayerSvc  *relayer.Service
 	webhookSvc  *webhook.Deliverer
+	nonceMgr    *nonce.Manager
+	rpcMgr      *rpc.Manager
 	concurrency int
 	pollTimeout int
 }
@@ -31,6 +35,8 @@ func New(
 	walletSvc *wallet.Service,
 	relayerSvc *relayer.Service,
 	webhookSvc *webhook.Deliverer,
+	nonceMgr *nonce.Manager,
+	rpcMgr *rpc.Manager,
 	concurrency, pollTimeout int,
 ) *Worker {
 	return &Worker{
@@ -39,6 +45,8 @@ func New(
 		walletSvc:   walletSvc,
 		relayerSvc:  relayerSvc,
 		webhookSvc:  webhookSvc,
+		nonceMgr:    nonceMgr,
+		rpcMgr:      rpcMgr,
 		concurrency: concurrency,
 		pollTimeout: pollTimeout,
 	}
@@ -46,7 +54,6 @@ func New(
 
 // Start launches the worker pool. Blocks until ctx is cancelled.
 func (w *Worker) Start(ctx context.Context) {
-	// Recover any stalled jobs from a previous crash on startup
 	recovered, err := w.queue.RecoverStalled(ctx, 5*time.Minute)
 	if err != nil {
 		log.Printf("worker: stall recovery error: %v", err)
@@ -78,11 +85,11 @@ func (w *Worker) loop(ctx context.Context, workerID int) {
 		job, err := w.queue.Dequeue(ctx, w.pollTimeout)
 		if err != nil {
 			log.Printf("worker[%d]: dequeue error: %v", workerID, err)
-			time.Sleep(time.Second) // backoff on Redis errors
+			time.Sleep(time.Second)
 			continue
 		}
 		if job == nil {
-			continue // poll timeout, loop again
+			continue
 		}
 
 		if err := w.processJob(ctx, job); err != nil {
@@ -92,43 +99,36 @@ func (w *Worker) loop(ctx context.Context, workerID int) {
 }
 
 func (w *Worker) processJob(ctx context.Context, qJob *queue.Job) error {
-	// Fetch full job from DB
 	dbJob, err := w.store.GetSigningJob(ctx, qJob.ID, qJob.ProjectID)
 	if err != nil {
 		return fmt.Errorf("fetch job from db: %w", err)
 	}
 	if dbJob == nil {
-		// Job doesn't exist - acknowledge and discard
 		w.queue.Acknowledge(ctx, *qJob) //nolint:errcheck
 		return fmt.Errorf("job %s not found in db, discarding", qJob.ID)
 	}
 
-	// Skip if already completed or dead (duplicate delivery protection)
 	if dbJob.Status == "completed" || dbJob.Status == "dead" {
 		w.queue.Acknowledge(ctx, *qJob) //nolint:errcheck
 		return nil
 	}
 
-	// Fetch the wallet
 	wlt, err := w.store.GetWalletByID(ctx, dbJob.WalletID, dbJob.ProjectID)
 	if err != nil || wlt == nil {
 		w.handleJobFailure(ctx, qJob, dbJob, "wallet not found or db error")
 		return nil
 	}
 
-	// Fetch project for webhook config and retry settings
 	proj, err := w.store.GetProjectByID(ctx, dbJob.ProjectID)
 	if err != nil || proj == nil {
 		w.handleJobFailure(ctx, qJob, dbJob, "project not found")
 		return nil
 	}
 
-	// Mark as processing in DB
 	if err := w.store.MarkJobProcessing(ctx, dbJob.ID); err != nil {
 		return fmt.Errorf("mark processing: %w", err)
 	}
 
-	// Execute the signing operation
 	result, signingErr := w.sign(ctx, dbJob, wlt)
 
 	if signingErr != nil {
@@ -137,23 +137,19 @@ func (w *Worker) processJob(ctx context.Context, qJob *queue.Job) error {
 		return nil
 	}
 
-	// Mark completed
 	resultJSON, _ := json.Marshal(result)
 	if err := w.store.MarkJobCompleted(ctx, dbJob.ID, resultJSON); err != nil {
 		log.Printf("job %s: failed to mark completed: %v", dbJob.ID, err)
 	}
 
-	// Acknowledge job from processing queue
 	w.queue.Acknowledge(ctx, *qJob) //nolint:errcheck
 
-	// Write audit log
 	walletID := wlt.ID
 	jobID := dbJob.ID
 	w.store.WriteAuditLog(ctx, dbJob.ProjectID, &walletID, &jobID, dbJob.Operation, "worker", map[string]any{ //nolint:errcheck
 		"status": "completed",
 	})
 
-	// Deliver webhook
 	w.deliverWebhook(ctx, proj, dbJob, result, "")
 
 	return nil
@@ -162,10 +158,10 @@ func (w *Worker) processJob(ctx context.Context, qJob *queue.Job) error {
 type signingResult struct {
 	Signature string `json:"signature,omitempty"`
 	SignedTx  string `json:"signed_tx,omitempty"`
+	TxHash    string `json:"tx_hash,omitempty"`
 }
 
 func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
-	// Route gasless jobs through the relayer service
 	if job.Gasless {
 		return w.signGasless(ctx, job, wlt)
 	}
@@ -176,8 +172,24 @@ func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage
 		if err := json.Unmarshal(job.Payload, &tx); err != nil {
 			return nil, fmt.Errorf("invalid evm transaction payload: %w", err)
 		}
+
+		chainIDStr := fmt.Sprintf("%d", tx.ChainID)
+
+		// Ensure nonce counter is initialised for this wallet+chain.
+		// Uses pending nonce from chain on first use or after Redis key expiry.
+		if err := w.ensureNonce(ctx, chainIDStr, wlt.Address); err != nil {
+			return nil, fmt.Errorf("nonce init: %w", err)
+		}
+
+		txNonce, err := w.nonceMgr.Next(ctx, chainIDStr, wlt.Address)
+		if err != nil {
+			return nil, fmt.Errorf("get nonce: %w", err)
+		}
+		tx.Nonce = txNonce
+
 		signed, err := w.walletSvc.SignEVMTransaction(ctx, wlt.EncryptedKey, wlt.EncryptedDEK, tx)
 		if err != nil {
+			w.resyncNonce(ctx, chainIDStr, wlt.Address) //nolint:errcheck
 			return nil, err
 		}
 		return &signingResult{SignedTx: "0x" + fmt.Sprintf("%x", signed)}, nil
@@ -229,7 +241,7 @@ func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage
 }
 
 // signGasless routes the job through the relayer service.
-// The relayer pays gas; the user wallet's intent is encoded in the payload.
+// Both EVM and Solana relay to broadcast inside the service - no SignedTx is returned.
 func (w *Worker) signGasless(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
 	switch job.Operation {
 	case "sign_tx_evm":
@@ -241,7 +253,8 @@ func (w *Worker) signGasless(ctx context.Context, job *storage.SigningJob, wlt *
 		if err != nil {
 			return nil, err
 		}
-		return &signingResult{SignedTx: result.SignedTx}, nil
+		// RelayEVM broadcasts - result contains tx_hash, not signed_tx
+		return &signingResult{TxHash: result.TxHash}, nil
 
 	case "sign_tx_solana":
 		var payload relayer.SolanaRelayPayload
@@ -259,10 +272,28 @@ func (w *Worker) signGasless(ctx context.Context, job *storage.SigningJob, wlt *
 	}
 }
 
+func (w *Worker) ensureNonce(ctx context.Context, chainID, address string) error {
+	current, err := w.nonceMgr.Peek(ctx, chainID, address)
+	if err != nil {
+		return err
+	}
+	if current > 0 {
+		return nil
+	}
+	return w.resyncNonce(ctx, chainID, address)
+}
+
+func (w *Worker) resyncNonce(ctx context.Context, chainID, address string) error {
+	pendingNonce, err := w.rpcMgr.EVMPendingNonce(ctx, chainID, address)
+	if err != nil {
+		return fmt.Errorf("fetch pending nonce from chain: %w", err)
+	}
+	return w.nonceMgr.SyncFromChain(ctx, chainID, address, pendingNonce)
+}
+
 func (w *Worker) handleJobFailure(ctx context.Context, qJob *queue.Job, dbJob *storage.SigningJob, reason string) {
 	log.Printf("job %s failed: %s (attempt %d)", dbJob.ID, reason, dbJob.Attempts)
 
-	// Fetch project to get max retries config
 	proj, _ := w.store.GetProjectByID(ctx, dbJob.ProjectID)
 	maxRetries := 3
 	if proj != nil {
@@ -270,13 +301,11 @@ func (w *Worker) handleJobFailure(ctx context.Context, qJob *queue.Job, dbJob *s
 	}
 
 	if dbJob.Attempts >= maxRetries {
-		// Exhausted retries - move to DLQ
-		w.store.MarkJobDead(ctx, dbJob.ID, reason)        //nolint:errcheck
-		w.queue.MoveToDLQ(ctx, *qJob, reason)             //nolint:errcheck
-		w.queue.Acknowledge(ctx, *qJob)                   //nolint:errcheck
+		w.store.MarkJobDead(ctx, dbJob.ID, reason)  //nolint:errcheck
+		w.queue.MoveToDLQ(ctx, *qJob, reason)        //nolint:errcheck
+		w.queue.Acknowledge(ctx, *qJob)              //nolint:errcheck
 		log.Printf("job %s moved to DLQ after %d attempts", dbJob.ID, dbJob.Attempts)
 	} else {
-		// Requeue for retry
 		w.store.MarkJobFailed(ctx, dbJob.ID, reason) //nolint:errcheck
 		w.queue.Requeue(ctx, *qJob)                  //nolint:errcheck
 	}
@@ -284,7 +313,7 @@ func (w *Worker) handleJobFailure(ctx context.Context, qJob *queue.Job, dbJob *s
 
 func (w *Worker) deliverWebhook(ctx context.Context, proj *storage.Project, job *storage.SigningJob, result *signingResult, errMsg string) {
 	if proj.WebhookURL == nil || *proj.WebhookURL == "" {
-		w.store.MarkWebhookFailed(ctx, job.ID) //nolint:errcheck - no webhook configured, mark skipped
+		w.store.MarkWebhookFailed(ctx, job.ID) //nolint:errcheck
 		return
 	}
 

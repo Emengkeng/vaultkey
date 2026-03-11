@@ -20,14 +20,16 @@ type EVMKeyPair struct {
 	Address         string
 }
 
+// EVMTransaction is the signing payload for an EVM transaction.
+// Nonce is managed internally by the nonce manager — callers never set it.
 type EVMTransaction struct {
-	To       string   `json:"to"`
-	Value    string   `json:"value"`     // hex string, wei
-	Data     string   `json:"data"`      // hex string
-	GasLimit uint64   `json:"gas_limit"`
-	GasPrice string   `json:"gas_price"` // hex string, wei
-	Nonce    uint64   `json:"nonce"`
-	ChainID  int64    `json:"chain_id"`
+	To       string `json:"to"`
+	Value    string `json:"value"`    // hex string, wei
+	Data     string `json:"data"`     // hex string
+	GasLimit uint64 `json:"gas_limit"`
+	GasPrice string `json:"gas_price"` // hex string, wei
+	Nonce    uint64 `json:"-"`         // set by worker/relayer, never from caller
+	ChainID  int64  `json:"chain_id"`
 }
 
 func NewEVMWallet() *EVMWallet {
@@ -45,7 +47,6 @@ func (e *EVMWallet) Generate(_ context.Context) (*EVMKeyPair, error) {
 	privBytes := crypto.FromECDSA(privateKey)
 	address := crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
 
-	// zero the in-memory private key object immediately after extracting bytes
 	zeroECDSA(privateKey)
 
 	return &EVMKeyPair{
@@ -125,19 +126,15 @@ func (e *EVMWallet) SignMessage(_ context.Context, privKeyBytes []byte, message 
 		return nil, fmt.Errorf("sign evm message: %w", err)
 	}
 
-	// adjust recovery id to match eth_sign convention
 	sig[64] += 27
 
 	return sig, nil
 }
 
-// wipeBytes zeros a byte slice to minimize private key exposure in memory.
-// Note: Go GC may have already copied the slice; this is best-effort.
 func wipeBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
-	// overwrite with random bytes as second pass
 	rand.Read(b) //nolint:errcheck
 }
 
