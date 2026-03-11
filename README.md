@@ -21,7 +21,7 @@ Private keys are encrypted at rest (AES-256-GCM, per-wallet DEK, Vault-managed m
 ## Quick start
 
 ```bash
-git clone https://github.com/yourorg/vaultkey
+git clone https://github.com/Emengkeng/vaultkey
 cd vaultkey
 cp .env.example .env
 # edit .env with strong passwords

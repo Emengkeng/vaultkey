@@ -11,7 +11,7 @@
 ### Step 1: Clone & Setup
 
 ```bash
-git clone https://github.com/Emenkeng/vaultkey
+git clone https://github.com/Emengkeng/vaultkey
 cd vaultkey
 
 # Copy environment template
@@ -190,7 +190,7 @@ Before deploying to production, verify:
 curl -fsSL https://get.docker.com | sh
 
 # Clone repo
-git clone https://github.com/yourorg/vaultkey
+git clone https://github.com/Emengkeng/vaultkey
 cd vaultkey
 
 # Configure production environment

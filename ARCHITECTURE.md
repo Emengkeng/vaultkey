@@ -83,7 +83,7 @@ VaultKey is a production-grade custodial wallet infrastructure designed for exch
 
 ## Component Breakdown
 
-### 1. API Layer (`cmd/api/main.go`, `internal/api/handlers/`)
+### 1. API Layer (`cmd/server/main.go`, `internal/api/handlers/`)
 
 **Responsibilities:**
 - HTTP request handling
@@ -650,16 +650,3 @@ All operations are logged to `audit_log` table:
 Retention: Indefinite (customer responsibility to archive)
 
 ---
-
-## License
-
-MIT License - See LICENSE file for details
-
----
-
-## Support
-
-- **Documentation:** https://docs.vaultkey.io (TODO)
-- **GitHub Issues:** https://github.com/yourorg/vaultkey/issues
-- **Email:** support@vaultkey.io
-- **Discord:** https://discord.gg/vaultkey (TODO)
