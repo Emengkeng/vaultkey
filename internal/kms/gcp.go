@@ -15,21 +15,47 @@ import (
 // keyName must be the full resource name:
 // projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
 //
-// Authentication is handled by Application Default Credentials (ADC).
-// In production: attach a service account to the GKE node or Cloud Run instance.
-// Locally: set GOOGLE_APPLICATION_CREDENTIALS to a service account key file,
-// or run: gcloud auth application-default login
+// Authentication is resolved in this order:
+//  1. GOOGLE_APPLICATION_CREDENTIALS_JSON — full service account JSON as an env var.
+//     Use this when running outside GCP without a file mount.
+//  2. GOOGLE_APPLICATION_CREDENTIALS — path to a service account key file.
+//     Use this when you have the file available locally.
+//  3. Application Default Credentials (ADC) — automatic on GCP infrastructure
+//     (Cloud Run, GKE with Workload Identity, GCE). No config needed.
 type GCPKMS struct {
 	client  *kmsapi.KeyManagementClient
 	keyName string
 }
 
-func NewGCP(ctx context.Context, keyName string, opts ...option.ClientOption) (*GCPKMS, error) {
+// GCPOptions holds authentication options for the GCP KMS adapter.
+// All fields are optional — leave them empty to fall through to ADC.
+type GCPOptions struct {
+	// CredentialsJSON is the full contents of a service account key JSON file.
+	// Maps to the GOOGLE_APPLICATION_CREDENTIALS_JSON env var.
+	CredentialsJSON string
+
+	// CredentialsFile is a path to a service account key JSON file.
+	// Maps to the GOOGLE_APPLICATION_CREDENTIALS env var.
+	// Ignored if CredentialsJSON is set.
+	CredentialsFile string
+}
+
+func NewGCP(ctx context.Context, keyName string, gcpOpts GCPOptions) (*GCPKMS, error) {
 	if keyName == "" {
 		return nil, fmt.Errorf("gcp kms: keyName is required")
 	}
 
-	client, err := kmsapi.NewKeyManagementClient(ctx, opts...)
+	var clientOpts []option.ClientOption
+
+	switch {
+	case gcpOpts.CredentialsJSON != "":
+		clientOpts = append(clientOpts, option.WithCredentialsJSON([]byte(gcpOpts.CredentialsJSON)))
+	case gcpOpts.CredentialsFile != "":
+		clientOpts = append(clientOpts, option.WithCredentialsFile(gcpOpts.CredentialsFile))
+	// default: ADC — no option needed, the SDK handles it
+	}
+
+	client, err := kmsapi.NewKeyManagementClient(ctx, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("gcp kms: create client: %w", err)
 	}
@@ -49,8 +75,6 @@ func (g *GCPKMS) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) 
 		return nil, fmt.Errorf("gcp kms encrypt: %w", err)
 	}
 
-	// Base64-encode so ciphertext is safe to store as TEXT in Postgres,
-	// consistent with how Vault returns its ciphertext blob.
 	encoded := base64.StdEncoding.EncodeToString(resp.Ciphertext)
 	return []byte(encoded), nil
 }
@@ -72,7 +96,6 @@ func (g *GCPKMS) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
 	return resp.Plaintext, nil
 }
 
-// Health checks that the key is accessible and enabled.
 func (g *GCPKMS) Health(ctx context.Context) error {
 	_, err := g.client.GetCryptoKey(ctx, &kmspb.GetCryptoKeyRequest{
 		Name: g.keyName,

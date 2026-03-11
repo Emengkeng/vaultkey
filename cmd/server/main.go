@@ -24,7 +24,6 @@ import (
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
 	"github.com/vaultkey/vaultkey/internal/worker"
-	"google.golang.org/api/option"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 )
@@ -171,11 +170,10 @@ func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) 
 		), nil
 
 	case "gcp":
-		var opts []option.ClientOption
-		if cfg.GCP.CredentialsFile != "" {
-			opts = append(opts, option.WithCredentialsFile(cfg.GCP.CredentialsFile))
-		}
-		return internalkms.NewGCP(ctx, cfg.GCP.KeyName, opts...)
+		return internalkms.NewGCP(ctx, cfg.GCP.KeyName, internalkms.GCPOptions{
+			CredentialsJSON: cfg.GCP.CredentialsJSON,
+			CredentialsFile: cfg.GCP.CredentialsFile,
+		})
 
 	case "aws":
 		return internalkms.NewAWS(ctx, cfg.AWS.KeyID,

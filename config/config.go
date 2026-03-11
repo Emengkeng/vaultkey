@@ -35,9 +35,15 @@ type VaultConfig struct {
 // GCPConfig holds configuration for Google Cloud KMS.
 // KeyName is the full resource name:
 // projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
+// GCPConfig holds configuration for Google Cloud KMS.
+// Credential resolution order:
+//  1. CredentialsJSON (GOOGLE_APPLICATION_CREDENTIALS_JSON) — inline JSON, no file needed
+//  2. CredentialsFile (GOOGLE_APPLICATION_CREDENTIALS) — path to key file
+//  3. ADC — automatic on GCP infrastructure (Cloud Run, GKE), nothing to set
 type GCPConfig struct {
-	KeyName                    string
-	CredentialsFile            string // path to service account JSON, empty = ADC
+	KeyName         string
+	CredentialsJSON string // full service account JSON as env var (GOOGLE_APPLICATION_CREDENTIALS_JSON)
+	CredentialsFile string // path to key file (GOOGLE_APPLICATION_CREDENTIALS)
 }
 
 // AWSConfig holds configuration for AWS KMS.
@@ -114,6 +120,7 @@ func Load() (*Config, error) {
 		}
 		cfg.GCP = GCPConfig{
 			KeyName:         keyName,
+			CredentialsJSON: getEnv("GOOGLE_APPLICATION_CREDENTIALS_JSON", ""),
 			CredentialsFile: getEnv("GOOGLE_APPLICATION_CREDENTIALS", ""),
 		}
 

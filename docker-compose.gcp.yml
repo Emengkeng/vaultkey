@@ -7,13 +7,18 @@ version: "3.9"
 #
 # Required env vars (set in .env or your CI/CD secret manager):
 #
-#   GCP_KMS_KEY_NAME=projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
-#   GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp-sa-key.json
+#   GCP_KMS_KEY_NAME — full resource name of the key version
 #
-# Authentication options (pick one):
-#   1. Service account key file — mount it as a secret (shown below)
-#   2. Workload Identity (GKE) — remove the volume mount and credentials env var,
-#      the SDK picks up the metadata server automatically
+# Authentication — pick one, no file mounts required:
+#
+#   Option A: Inline credentials (running outside GCP)
+#     Set GOOGLE_APPLICATION_CREDENTIALS_JSON to the full contents of your
+#     service account key JSON. Paste the JSON as a single-line string or
+#     use your secret manager to inject it.
+#
+#   Option B: Workload Identity (GKE, Cloud Run, GCE)
+#     Attach a service account to your compute resource.
+#     Leave both credential env vars unset — the SDK finds them automatically.
 #
 # Usage:
 #   docker compose -f docker-compose.gcp.yml up
@@ -73,8 +78,10 @@ services:
       # KMS
       KMS_PROVIDER: gcp
       GCP_KMS_KEY_NAME: ${GCP_KMS_KEY_NAME}
-      # Remove GOOGLE_APPLICATION_CREDENTIALS if using Workload Identity
-      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa-key.json
+      # Option A: inline JSON credentials (no file mount needed)
+      # Paste the service account key JSON as a single env var.
+      # Leave unset when using Workload Identity on GKE/Cloud Run.
+      GOOGLE_APPLICATION_CREDENTIALS_JSON: ${GOOGLE_APPLICATION_CREDENTIALS_JSON:-}
 
       # Redis
       REDIS_ADDR: redis:6379
@@ -94,10 +101,6 @@ services:
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
     ports:
       - "8080:8080"
-    volumes:
-      # Mount service account key — use Docker secrets or your secret manager
-      # in production instead of a plain file mount.
-      - ${GCP_SA_KEY_FILE:-./secrets/gcp-sa-key.json}:/run/secrets/gcp-sa-key.json:ro
     networks:
       - internal
       - external
