@@ -52,7 +52,6 @@ func New(
 	}
 }
 
-// Start launches the worker pool. Blocks until ctx is cancelled.
 func (w *Worker) Start(ctx context.Context) {
 	recovered, err := w.queue.RecoverStalled(ctx, 5*time.Minute)
 	if err != nil {
@@ -162,6 +161,13 @@ type signingResult struct {
 }
 
 func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
+	// Sweep operations are always gasless and have their own dedicated path.
+	// They must be checked before the gasless flag because sweep sets gasless=true
+	// but needs different payload parsing and post-signing side effects (MarkWalletSwept).
+	if job.Operation == "sweep_evm" || job.Operation == "sweep_solana" {
+		return w.signSweep(ctx, job, wlt)
+	}
+
 	if job.Gasless {
 		return w.signGasless(ctx, job, wlt)
 	}
@@ -175,8 +181,6 @@ func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage
 
 		chainIDStr := fmt.Sprintf("%d", tx.ChainID)
 
-		// Ensure nonce counter is initialised for this wallet+chain.
-		// Uses pending nonce from chain on first use or after Redis key expiry.
 		if err := w.ensureNonce(ctx, chainIDStr, wlt.Address); err != nil {
 			return nil, fmt.Errorf("nonce init: %w", err)
 		}
@@ -209,7 +213,7 @@ func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage
 
 	case "sign_tx_solana":
 		var msg struct {
-			Message string `json:"message"` // hex encoded tx bytes
+			Message string `json:"message"`
 		}
 		if err := json.Unmarshal(job.Payload, &msg); err != nil {
 			return nil, fmt.Errorf("invalid solana tx payload: %w", err)
@@ -240,8 +244,6 @@ func (w *Worker) sign(ctx context.Context, job *storage.SigningJob, wlt *storage
 	}
 }
 
-// signGasless routes the job through the relayer service.
-// Both EVM and Solana relay to broadcast inside the service - no SignedTx is returned.
 func (w *Worker) signGasless(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
 	switch job.Operation {
 	case "sign_tx_evm":
@@ -253,7 +255,6 @@ func (w *Worker) signGasless(ctx context.Context, job *storage.SigningJob, wlt *
 		if err != nil {
 			return nil, err
 		}
-		// RelayEVM broadcasts - result contains tx_hash, not signed_tx
 		return &signingResult{TxHash: result.TxHash}, nil
 
 	case "sign_tx_solana":
@@ -270,6 +271,97 @@ func (w *Worker) signGasless(ctx context.Context, job *storage.SigningJob, wlt *
 	default:
 		return nil, fmt.Errorf("gasless not supported for operation: %s", job.Operation)
 	}
+}
+
+// signSweep handles sweep_evm and sweep_solana jobs.
+// Sweep is always gasless — the relayer pays fees so the full balance transfers.
+func (w *Worker) signSweep(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
+	switch job.Operation {
+	case "sweep_evm":
+		return w.signSweepEVM(ctx, job, wlt)
+	case "sweep_solana":
+		return w.signSweepSolana(ctx, job, wlt)
+	default:
+		return nil, fmt.Errorf("unknown sweep operation: %s", job.Operation)
+	}
+}
+
+type sweepEVMPayload struct {
+	To      string `json:"to"`
+	Value   string `json:"value"`
+	Data    string `json:"data"`
+	ChainID string `json:"chain_id"`
+	Sweep   bool   `json:"sweep"`
+}
+
+type sweepSolanaPayload struct {
+	To     string `json:"to"`
+	Amount uint64 `json:"amount"`
+	Sweep  bool   `json:"sweep"`
+}
+
+func (w *Worker) signSweepEVM(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
+	var p sweepEVMPayload
+	if err := json.Unmarshal(job.Payload, &p); err != nil {
+		return nil, fmt.Errorf("invalid sweep evm payload: %w", err)
+	}
+
+	// Re-fetch balance at signing time. The value in the payload was captured
+	// at job creation. If another transaction changed the balance between
+	// creation and now, we use the fresher value to avoid sending more than exists.
+	currentBalance, err := w.rpcMgr.EVMBalance(ctx, p.ChainID, wlt.Address)
+	if err != nil {
+		// Fall back to the balance captured at job creation
+		currentBalance = p.Value
+	}
+
+	chainIDInt, err := parseChainID(p.ChainID)
+	if err != nil {
+		return nil, fmt.Errorf("parse chain_id: %w", err)
+	}
+
+	relayPayload := relayer.EVMRelayPayload{
+		To:      p.To,
+		Value:   currentBalance,
+		Data:    "0x",
+		ChainID: chainIDInt,
+	}
+
+	result, err := w.relayerSvc.RelayEVM(ctx, job.ProjectID, wlt, relayPayload)
+	if err != nil {
+		return nil, fmt.Errorf("sweep relay evm: %w", err)
+	}
+
+	w.store.MarkWalletSwept(ctx, wlt.ID) //nolint:errcheck
+
+	return &signingResult{TxHash: result.TxHash}, nil
+}
+
+func (w *Worker) signSweepSolana(ctx context.Context, job *storage.SigningJob, wlt *storage.Wallet) (*signingResult, error) {
+	var p sweepSolanaPayload
+	if err := json.Unmarshal(job.Payload, &p); err != nil {
+		return nil, fmt.Errorf("invalid sweep solana payload: %w", err)
+	}
+
+	// Re-fetch balance at signing time for same reason as EVM
+	currentBalance, err := w.rpcMgr.SolanaBalance(ctx, wlt.Address)
+	if err != nil {
+		currentBalance = p.Amount
+	}
+
+	relayPayload := relayer.SolanaRelayPayload{
+		To:     p.To,
+		Amount: currentBalance,
+	}
+
+	result, err := w.relayerSvc.RelaySolana(ctx, job.ProjectID, wlt, relayPayload)
+	if err != nil {
+		return nil, fmt.Errorf("sweep relay solana: %w", err)
+	}
+
+	w.store.MarkWalletSwept(ctx, wlt.ID) //nolint:errcheck
+
+	return &signingResult{Signature: result.Signature}, nil
 }
 
 func (w *Worker) ensureNonce(ctx context.Context, chainID, address string) error {
@@ -354,4 +446,14 @@ func (w *Worker) deliverWebhook(ctx context.Context, proj *storage.Project, job 
 	}
 
 	w.store.MarkWebhookDelivered(ctx, job.ID) //nolint:errcheck
+}
+
+// parseChainID converts a string chain ID like "137" to int64.
+func parseChainID(s string) (int64, error) {
+	var id int64
+	_, err := fmt.Sscanf(s, "%d", &id)
+	if err != nil {
+		return 0, fmt.Errorf("chain_id %q is not a valid integer: %w", s, err)
+	}
+	return id, nil
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/relayer"
 	"github.com/vaultkey/vaultkey/internal/rpc"
 	"github.com/vaultkey/vaultkey/internal/storage"
+	"github.com/vaultkey/vaultkey/internal/sweep"
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
 	"github.com/vaultkey/vaultkey/internal/worker"
@@ -76,6 +77,7 @@ func main() {
 	rpcMgr := rpc.NewManager(cfg.RPC.EVMEndpoints, cfg.RPC.SolanaEndpoint)
 	webhookSvc := webhook.New()
 	relayerSvc := relayer.New(store, walletSvc, rpcMgr, nonceMgr)
+	sweepSvc := sweep.New(store, walletSvc, rpcMgr, q)
 
 	// ── Worker Pool ──────────────────────────────────────────
 	w := worker.New(
@@ -97,6 +99,7 @@ func main() {
 	// ── HTTP Handlers ────────────────────────────────────────
 	h := handlers.New(store, walletSvc, q, rpcMgr)
 	relayerH := handlers.NewRelayerHandler(store, walletSvc, relayerSvc)
+	sweepH := handlers.NewSweepHandler(store, sweepSvc)
 	authed := middleware.Auth(store, limiter)
 
 	mux := http.NewServeMux()
@@ -106,22 +109,36 @@ func main() {
 
 	mux.Handle("PATCH /project/webhook", authed(http.HandlerFunc(h.UpdateWebhook)))
 
+	// Relayer management
 	mux.Handle("POST /projects/relayer", authed(http.HandlerFunc(relayerH.RegisterRelayer)))
 	mux.Handle("GET /projects/relayer", authed(http.HandlerFunc(relayerH.GetRelayerInfo)))
 	mux.Handle("GET /projects/relayers", authed(http.HandlerFunc(relayerH.ListRelayers)))
 	mux.Handle("DELETE /projects/relayer/{relayerId}", authed(http.HandlerFunc(relayerH.DeactivateRelayer)))
 
+	// Master wallet / sweep config management
+	mux.Handle("POST /projects/master-wallet", authed(http.HandlerFunc(sweepH.ProvisionMasterWallet)))
+	mux.Handle("GET /projects/master-wallet", authed(http.HandlerFunc(sweepH.GetMasterWallet)))
+	mux.Handle("GET /projects/master-wallets", authed(http.HandlerFunc(sweepH.ListMasterWallets)))
+	mux.Handle("PATCH /projects/master-wallet/{configId}", authed(http.HandlerFunc(sweepH.UpdateSweepConfig)))
+
+	// Wallet CRUD
 	mux.Handle("POST /wallets", authed(http.HandlerFunc(h.CreateWallet)))
 	mux.Handle("GET /wallets/{walletId}", authed(http.HandlerFunc(h.GetWallet)))
 	mux.Handle("GET /users/{userId}/wallets", authed(http.HandlerFunc(h.ListUserWallets)))
 
+	// Signing
 	mux.Handle("POST /wallets/{walletId}/sign/transaction/evm", authed(http.HandlerFunc(h.SubmitSignEVMTransaction)))
 	mux.Handle("POST /wallets/{walletId}/sign/message/evm", authed(http.HandlerFunc(h.SubmitSignEVMMessage)))
 	mux.Handle("POST /wallets/{walletId}/sign/transaction/solana", authed(http.HandlerFunc(h.SubmitSignSolanaTransaction)))
 	mux.Handle("POST /wallets/{walletId}/sign/message/solana", authed(http.HandlerFunc(h.SubmitSignSolanaMessage)))
 
+	// Sweep trigger
+	mux.Handle("POST /wallets/{walletId}/sweep", authed(http.HandlerFunc(sweepH.TriggerSweep)))
+
+	// Jobs
 	mux.Handle("GET /jobs/{jobId}", authed(http.HandlerFunc(h.GetJob)))
 
+	// Balance + broadcast
 	mux.Handle("GET /wallets/{walletId}/balance", authed(http.HandlerFunc(h.GetBalance)))
 	mux.Handle("POST /wallets/{walletId}/broadcast", authed(http.HandlerFunc(h.Broadcast)))
 
@@ -158,7 +175,6 @@ func main() {
 	log.Println("stopped")
 }
 
-// buildKMS constructs the correct KMS backend based on KMS_PROVIDER.
 func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) {
 	switch cfg.KMS.Provider {
 	case "vault":
@@ -168,18 +184,15 @@ func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) 
 			cfg.Vault.MountPath,
 			cfg.Vault.KeyName,
 		), nil
-
 	case "gcp":
 		return internalkms.NewGCP(ctx, cfg.GCP.KeyName, internalkms.GCPOptions{
 			CredentialsJSON: cfg.GCP.CredentialsJSON,
 			CredentialsFile: cfg.GCP.CredentialsFile,
 		})
-
 	case "aws":
 		return internalkms.NewAWS(ctx, cfg.AWS.KeyID,
 			awscfg.WithRegion(cfg.AWS.Region),
 		)
-
 	default:
 		return nil, fmt.Errorf("unknown KMS provider: %s", cfg.KMS.Provider)
 	}

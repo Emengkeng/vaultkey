@@ -109,6 +109,8 @@ type Wallet struct {
 	EncryptedKey []byte
 	EncryptedDEK []byte
 	Label        *string
+	IsMaster     bool       // true if this wallet is a sweep destination
+	SweptAt      *time.Time // last time this wallet was swept (nil if never)
 	CreatedAt    time.Time
 }
 
@@ -117,10 +119,14 @@ func (s *Store) CreateWallet(ctx context.Context, w *Wallet) (*Wallet, error) {
 	err := s.db.QueryRowContext(ctx,
 		`INSERT INTO wallets (project_id, user_id, chain_type, address, encrypted_key, encrypted_dek, label)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 RETURNING id, project_id, user_id, chain_type, address, encrypted_key, encrypted_dek, label, created_at`,
+		 RETURNING id, project_id, user_id, chain_type, address, encrypted_key, encrypted_dek,
+		           label, is_master, swept_at, created_at`,
 		w.ProjectID, w.UserID, w.ChainType, w.Address, w.EncryptedKey, w.EncryptedDEK, w.Label,
-	).Scan(&result.ID, &result.ProjectID, &result.UserID, &result.ChainType,
-		&result.Address, &result.EncryptedKey, &result.EncryptedDEK, &result.Label, &result.CreatedAt)
+	).Scan(
+		&result.ID, &result.ProjectID, &result.UserID, &result.ChainType,
+		&result.Address, &result.EncryptedKey, &result.EncryptedDEK, &result.Label,
+		&result.IsMaster, &result.SweptAt, &result.CreatedAt,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create wallet: %w", err)
 	}
@@ -130,11 +136,15 @@ func (s *Store) CreateWallet(ctx context.Context, w *Wallet) (*Wallet, error) {
 func (s *Store) GetWalletByID(ctx context.Context, walletID, projectID string) (*Wallet, error) {
 	w := &Wallet{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, project_id, user_id, chain_type, address, encrypted_key, encrypted_dek, label, created_at
+		`SELECT id, project_id, user_id, chain_type, address, encrypted_key, encrypted_dek,
+		        label, is_master, swept_at, created_at
 		 FROM wallets WHERE id = $1 AND project_id = $2`,
 		walletID, projectID,
-	).Scan(&w.ID, &w.ProjectID, &w.UserID, &w.ChainType,
-		&w.Address, &w.EncryptedKey, &w.EncryptedDEK, &w.Label, &w.CreatedAt)
+	).Scan(
+		&w.ID, &w.ProjectID, &w.UserID, &w.ChainType,
+		&w.Address, &w.EncryptedKey, &w.EncryptedDEK, &w.Label,
+		&w.IsMaster, &w.SweptAt, &w.CreatedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -146,7 +156,7 @@ func (s *Store) GetWalletByID(ctx context.Context, walletID, projectID string) (
 
 func (s *Store) ListWalletsByUserID(ctx context.Context, projectID, userID string) ([]*Wallet, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, project_id, user_id, chain_type, address, label, created_at
+		`SELECT id, project_id, user_id, chain_type, address, label, is_master, swept_at, created_at
 		 FROM wallets WHERE project_id = $1 AND user_id = $2 ORDER BY created_at ASC`,
 		projectID, userID,
 	)
@@ -157,7 +167,10 @@ func (s *Store) ListWalletsByUserID(ctx context.Context, projectID, userID strin
 	var wallets []*Wallet
 	for rows.Next() {
 		w := &Wallet{}
-		if err := rows.Scan(&w.ID, &w.ProjectID, &w.UserID, &w.ChainType, &w.Address, &w.Label, &w.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&w.ID, &w.ProjectID, &w.UserID, &w.ChainType, &w.Address,
+			&w.Label, &w.IsMaster, &w.SweptAt, &w.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		wallets = append(wallets, w)
@@ -276,15 +289,15 @@ func (s *Store) WriteAuditLog(ctx context.Context, projectID string, walletID, j
 // ── Relayer Wallets ───────────────────────────────────────────────────────────
 
 type RelayerWallet struct {
-	ID                string
-	ProjectID         string
-	WalletID          string
-	Address           string // denormalised from wallets table for convenience
-	ChainType         string
-	ChainID           string
-	MinBalanceAlert   string
-	Active            bool
-	CreatedAt         time.Time
+	ID              string
+	ProjectID       string
+	WalletID        string
+	Address         string
+	ChainType       string
+	ChainID         string
+	MinBalanceAlert string
+	Active          bool
+	CreatedAt       time.Time
 }
 
 func (s *Store) CreateRelayerWallet(ctx context.Context, projectID, walletID, address, chainType, chainID, minBalanceAlert string) (*RelayerWallet, error) {
@@ -306,7 +319,6 @@ func (s *Store) CreateRelayerWallet(ctx context.Context, projectID, walletID, ad
 
 func (s *Store) GetRelayerWallet(ctx context.Context, projectID, chainType, chainID string) (*RelayerWallet, error) {
 	rw := &RelayerWallet{}
-	// Match on chain_id or fall back to any relayer for the chain type
 	err := s.db.QueryRowContext(ctx,
 		`SELECT rw.id, rw.project_id, rw.wallet_id, w.address, rw.chain_type,
 		        COALESCE(rw.chain_id,''), rw.min_balance_alert, rw.active, rw.created_at
