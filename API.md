@@ -948,6 +948,281 @@ curl -X DELETE http://localhost:8080/projects/relayer/relayer_abc123 \
 
 ---
 
+### Sweep
+
+Sweep lets you automatically consolidate funds from user wallets into a single master wallet per chain. Useful for neobanks and exchange backends that need to pool deposits.
+
+**Prerequisites for sweep to work:**
+- A master wallet must be provisioned for the target chain
+- A relayer wallet must be configured and funded on the same chain
+- Sweep is supported on EVM L2s and Solana (not Ethereum mainnet)
+
+#### Provision Master Wallet
+
+Creates a new dedicated wallet and designates it as the sweep destination for a given chain. VaultKey always generates the wallet — you do not supply one.
+
+Calling this again for an already-configured chain is idempotent: it returns the existing config without creating a new wallet.
+
+```http
+POST /projects/master-wallet
+```
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "chain_type": "evm",
+  "chain_id": "137",
+  "dust_threshold": "1000000000000000"
+}
+```
+
+**Parameters:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `chain_type` | string | Yes | `evm` or `solana` |
+| `chain_id` | string | Yes* | Chain ID (*Required for EVM, must be omitted for Solana) |
+| `dust_threshold` | string | No | Minimum balance to sweep in native units (default: "0") |
+
+**Response:** `201 Created`
+```json
+{
+  "id": "sweepconfig_abc123",
+  "chain_type": "evm",
+  "chain_id": "137",
+  "master_wallet_id": "wallet_master_xyz",
+  "master_address": "0x9876543210abcdef...",
+  "dust_threshold": "1000000000000000",
+  "enabled": true
+}
+```
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/projects/master-wallet \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..." \
+  -d '{
+    "chain_type": "evm",
+    "chain_id": "137",
+    "dust_threshold": "1000000000000000"
+  }'
+```
+
+---
+
+#### Get Master Wallet
+
+Returns the sweep config and master wallet address for a specific chain.
+
+```http
+GET /projects/master-wallet
+```
+
+**Authentication:** Required
+
+**Query Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `chain_type` | string | Yes | `evm` or `solana` |
+| `chain_id` | string | Yes* | Chain ID (*EVM only) |
+
+**Response:** `200 OK`
+```json
+{
+  "id": "sweepconfig_abc123",
+  "chain_type": "evm",
+  "chain_id": "137",
+  "master_wallet_id": "wallet_master_xyz",
+  "master_address": "0x9876543210abcdef...",
+  "dust_threshold": "1000000000000000",
+  "enabled": true
+}
+```
+
+**Example (EVM):**
+```bash
+curl -X GET "http://localhost:8080/projects/master-wallet?chain_type=evm&chain_id=137" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..."
+```
+
+**Example (Solana):**
+```bash
+curl -X GET "http://localhost:8080/projects/master-wallet?chain_type=solana" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..."
+```
+
+---
+
+#### List Master Wallets
+
+Lists all sweep configs across all chains for the project.
+
+```http
+GET /projects/master-wallets
+```
+
+**Authentication:** Required
+
+**Response:** `200 OK`
+```json
+{
+  "master_wallets": [
+    {
+      "id": "sweepconfig_abc123",
+      "chain_type": "evm",
+      "chain_id": "137",
+      "master_wallet_id": "wallet_master_xyz",
+      "master_address": "0x9876543210abcdef...",
+      "dust_threshold": "1000000000000000",
+      "enabled": true
+    },
+    {
+      "id": "sweepconfig_def456",
+      "chain_type": "solana",
+      "chain_id": "",
+      "master_wallet_id": "wallet_master_sol",
+      "master_address": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+      "dust_threshold": "0",
+      "enabled": true
+    }
+  ]
+}
+```
+
+**Example:**
+```bash
+curl -X GET http://localhost:8080/projects/master-wallets \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..."
+```
+
+---
+
+#### Update Sweep Config
+
+Updates the `dust_threshold` and/or `enabled` flag for a sweep config.
+
+```http
+PATCH /projects/master-wallet/{configId}
+```
+
+**Authentication:** Required
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `configId` | string | Sweep config ID from provision/list response |
+
+**Request Body:**
+```json
+{
+  "dust_threshold": "5000000000000000",
+  "enabled": false
+}
+```
+
+**Parameters:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `dust_threshold` | string | No | New minimum balance to sweep in native units |
+| `enabled` | boolean | No | Enable or disable sweeping for this chain |
+
+Omitted fields retain their current values.
+
+**Response:** `200 OK`
+```json
+{
+  "status": "updated"
+}
+```
+
+**Example:**
+```bash
+curl -X PATCH http://localhost:8080/projects/master-wallet/sweepconfig_abc123 \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..." \
+  -d '{
+    "dust_threshold": "5000000000000000",
+    "enabled": true
+  }'
+```
+
+---
+
+#### Trigger Sweep
+
+Enqueues a sweep job for a wallet. The wallet's entire balance (above `dust_threshold`) is transferred to the master wallet. Gas is covered by the configured relayer.
+
+```http
+POST /wallets/{walletId}/sweep
+```
+
+**Authentication:** Required
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `walletId` | string | Wallet ID to sweep from |
+
+**Request Body:**
+```json
+{
+  "chain_type": "evm",
+  "chain_id": "137",
+  "idempotency_key": "sweep_user123_20260311"
+}
+```
+
+**Parameters:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `chain_type` | string | Yes | `evm` or `solana` |
+| `chain_id` | string | Yes* | Chain ID (*Required for EVM, must be omitted for Solana) |
+| `idempotency_key` | string | No | Deduplication key — reuses existing job if already submitted |
+
+**Response:** `202 Accepted` (new job)
+```json
+{
+  "job_id": "job_sweep_abc123",
+  "status": "pending"
+}
+```
+
+**Response:** `200 OK` (job already in progress or completed)
+```json
+{
+  "job_id": "job_sweep_abc123",
+  "status": "processing"
+}
+```
+
+**Notes:**
+- Requires a funded relayer on the target chain
+- Requires a master wallet provisioned for the target chain
+- Ethereum mainnet (`chain_id: 1`) is not supported for sweep
+- Use `GET /jobs/{jobId}` or webhooks to track the result
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/wallets/wallet_xyz789/sweep \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..." \
+  -d '{
+    "chain_type": "evm",
+    "chain_id": "137",
+    "idempotency_key": "sweep_user123_20260311"
+  }'
+```
+
+---
+
 ### Health Check
 
 #### System Health
@@ -1003,7 +1278,7 @@ VaultKey delivers job results to your webhook endpoint via HTTP POST.
 | `job_id` | string | Job ID |
 | `project_id` | string | Your project ID |
 | `wallet_id` | string | Wallet ID |
-| `operation` | string | Operation type (`sign_tx_evm`, `sign_msg_evm`, etc.) |
+| `operation` | string | Operation type (`sign_tx_evm`, `sign_msg_evm`, `sweep`, etc.) |
 | `status` | string | `completed`, `failed`, or `dead` |
 | `result` | object | Signing result (only present if `status=completed`) |
 | `error` | string | Error message (only present if `status=failed` or `dead`) |
@@ -1225,6 +1500,59 @@ while True:
     time.sleep(1)
 ```
 
+### Sweep Workflow (Python)
+
+```python
+import requests
+import time
+
+API_BASE = 'http://localhost:8080'
+headers = {
+    'X-API-Key': 'vk_live_...',
+    'X-API-Secret': 'vk_secret_...'
+}
+
+# 1. One-time setup: provision master wallet for Polygon
+master = requests.post(f'{API_BASE}/projects/master-wallet',
+    headers=headers,
+    json={
+        'chain_type': 'evm',
+        'chain_id': '137',
+        'dust_threshold': '1000000000000000'  # 0.001 MATIC
+    }
+).json()
+print(f'Master wallet: {master["master_address"]}')
+
+# 2. One-time setup: register and fund a relayer on Polygon
+relayer = requests.post(f'{API_BASE}/projects/relayer',
+    headers=headers,
+    json={'chain_type': 'evm', 'chain_id': '137'}
+).json()
+print(f'Fund relayer at: {relayer["address"]}')
+
+# 3. Trigger sweep for a user wallet
+job = requests.post(f'{API_BASE}/wallets/wallet_xyz789/sweep',
+    headers=headers,
+    json={
+        'chain_type': 'evm',
+        'chain_id': '137',
+        'idempotency_key': 'sweep_user123_20260311'
+    }
+).json()
+print(f'Sweep job: {job["job_id"]}')
+
+# 4. Poll for result
+while True:
+    status = requests.get(f'{API_BASE}/jobs/{job["job_id"]}', headers=headers).json()
+    if status['status'] == 'completed':
+        print('Sweep complete')
+        break
+    elif status['status'] in ('failed', 'dead'):
+        print(f'Sweep failed: {status["error"]}')
+        break
+    time.sleep(1)
+```
+
 ---
 
 ## Error Handling
@@ -1283,11 +1611,14 @@ while True:
 - `GET /jobs/{id}`
 - `GET /wallets/{id}/balance`
 - `POST /wallets/{id}/sign/*` (with `idempotency_key`)
+- `POST /wallets/{id}/sweep` (with `idempotency_key`)
 
 **Non-idempotent** (do NOT auto-retry without idempotency key):
 - `POST /wallets` (creates new wallet)
 - `POST /wallets/{id}/sign/*` (without `idempotency_key`)
+- `POST /wallets/{id}/sweep` (without `idempotency_key`)
 - `POST /projects/relayer`
+- `POST /projects/master-wallet`
 
 **Recommended retry strategy:**
 ```javascript
@@ -1358,6 +1689,24 @@ async function retryRequest(fn, maxRetries = 3) {
    - Balance changes slowly
    - Cache for 30-60 seconds
    - Invalidate on successful transaction
+
+### Sweep
+
+1. **Set a realistic dust threshold**
+   - Avoids sweeping wallets with negligible balances
+   - Account for gas cost of the sweep transaction itself
+
+2. **Use idempotency keys on sweep triggers**
+   - Safe to retry if your service crashes mid-request
+   - Format: `sweep_{user_id}_{date}`
+
+3. **Monitor relayer balance**
+   - Use `GET /projects/relayer` to check health before triggering sweeps
+   - Set `min_balance_alert` conservatively and top up proactively
+
+4. **Avoid Ethereum mainnet**
+   - Sweep is only supported on EVM L2s and Solana
+   - Gas costs on mainnet make sweeping uneconomical
 
 ### Error Handling
 
