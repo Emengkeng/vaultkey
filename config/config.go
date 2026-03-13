@@ -10,6 +10,7 @@ import (
 type Config struct {
 	Port        string
 	DatabaseURL string
+	AdminToken  string
 	KMS         KMSConfig
 	Vault       VaultConfig
 	GCP         GCPConfig
@@ -19,8 +20,6 @@ type Config struct {
 	RPC         RPCConfig
 }
 
-// KMSConfig controls which KMS backend is active.
-// Provider values: "vault" (default), "gcp", "aws"
 type KMSConfig struct {
 	Provider string
 }
@@ -33,17 +32,14 @@ type VaultConfig struct {
 }
 
 // GCPConfig holds configuration for Google Cloud KMS.
-// KeyName is the full resource name:
-// projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
-// GCPConfig holds configuration for Google Cloud KMS.
 // Credential resolution order:
-//  1. CredentialsJSON (GOOGLE_APPLICATION_CREDENTIALS_JSON) — inline JSON, no file needed
+//  1. CredentialsJSON (GOOGLE_APPLICATION_CREDENTIALS_JSON) — inline JSON
 //  2. CredentialsFile (GOOGLE_APPLICATION_CREDENTIALS) — path to key file
-//  3. ADC — automatic on GCP infrastructure (Cloud Run, GKE), nothing to set
+//  3. ADC — automatic on GCP infrastructure (Cloud Run, GKE)
 type GCPConfig struct {
 	KeyName         string
-	CredentialsJSON string // full service account JSON as env var (GOOGLE_APPLICATION_CREDENTIALS_JSON)
-	CredentialsFile string // path to key file (GOOGLE_APPLICATION_CREDENTIALS)
+	CredentialsJSON string
+	CredentialsFile string
 }
 
 // AWSConfig holds configuration for AWS KMS.
@@ -72,9 +68,16 @@ type RPCConfig struct {
 func Load() (*Config, error) {
 	provider := getEnv("KMS_PROVIDER", "vault")
 
+	// ADMIN_TOKEN is required. Without it the /admin/* routes would be unprotected.
+	adminToken := os.Getenv("ADMIN_TOKEN")
+	if adminToken == "" {
+		return nil, fmt.Errorf("ADMIN_TOKEN env var is required — set a strong random value to protect admin endpoints")
+	}
+
 	cfg := &Config{
 		Port:        getEnv("PORT", "8080"),
 		DatabaseURL: requireEnv("DATABASE_URL"),
+		AdminToken:  adminToken,
 		KMS: KMSConfig{
 			Provider: provider,
 		},
