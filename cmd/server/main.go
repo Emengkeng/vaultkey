@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/clerk/clerk-sdk-go/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/vaultkey/vaultkey/config"
 	"github.com/vaultkey/vaultkey/internal/api/handlers"
@@ -39,7 +40,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ── KMS ──────────────────────────────────────────────────
+	// ── Clerk SDK init (cloud mode only) ─────────────────────────────────────
+	if cfg.Cloud.EnableCloudFeatures {
+		clerk.SetKey(cfg.Cloud.ClerkSecretKey)
+		log.Println("clerk: initialized (cloud mode enabled)")
+	}
+
+	// ── KMS ──────────────────────────────────────────────────────────────────
 	kmsBackend, err := buildKMS(ctx, cfg)
 	if err != nil {
 		log.Fatalf("init kms: %v", err)
@@ -49,14 +56,14 @@ func main() {
 	}
 	log.Printf("kms: connected (provider=%s)", cfg.KMS.Provider)
 
-	// ── Storage ──────────────────────────────────────────────
+	// ── Storage ───────────────────────────────────────────────────────────────
 	store, err := storage.New(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("connect db: %v", err)
 	}
 	defer store.Close()
 
-	// ── Redis ────────────────────────────────────────────────
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	q, err := queue.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		log.Fatalf("connect redis: %v", err)
@@ -73,20 +80,17 @@ func main() {
 	limiter := ratelimit.New(redisClient)
 	nonceMgr := nonce.New(redisClient)
 
-	// ── Services ─────────────────────────────────────────────
+	// ── Services ──────────────────────────────────────────────────────────────
 	walletSvc := wallet.NewService(kmsBackend)
 	rpcMgr := rpc.NewManager(cfg.RPC.EVMEndpoints, cfg.RPC.SolanaEndpoint)
 	webhookSvc := webhook.New()
 	relayerSvc := relayer.New(store, walletSvc, rpcMgr, nonceMgr)
 	sweepSvc := sweep.New(store, walletSvc, rpcMgr, q)
 
-	// Stablecoin registry: DB-backed, Redis-cached.
-	// Shared between the stablecoin service and the admin handler so that
-	// writes via the admin API invalidate the cache the service reads from.
 	registry := stablecoin.NewRegistry(store, redisClient)
 	stablecoinSvc := stablecoin.NewService(store, rpcMgr, q, registry)
 
-	// ── Worker Pool ──────────────────────────────────────────
+	// ── Worker Pool ───────────────────────────────────────────────────────────
 	w := worker.New(
 		store, q, walletSvc, relayerSvc, webhookSvc, nonceMgr, rpcMgr,
 		cfg.Worker.Concurrency,
@@ -97,7 +101,7 @@ func main() {
 		w.Start(ctx)
 	}()
 
-	// ── HTTP Handlers ────────────────────────────────────────
+	// ── HTTP Handlers ─────────────────────────────────────────────────────────
 	h := handlers.New(store, walletSvc, q, rpcMgr)
 	relayerH := handlers.NewRelayerHandler(store, walletSvc, relayerSvc)
 	sweepH := handlers.NewSweepHandler(store, sweepSvc)
@@ -109,12 +113,11 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// ── Public ───────────────────────────────────────────────
+	// ── Public ────────────────────────────────────────────────────────────────
 	mux.HandleFunc("POST /projects", h.CreateProject)
 	mux.HandleFunc("GET /health", healthHandler(kmsBackend, q))
-	// mux.HandleFunc("GET /stablecoins", stablecoinH.SupportedTokens)
 
-	// ── Project-authed ────────────────────────────────────────
+	// ── Project-authed (API key) ───────────────────────────────────────────────
 	mux.Handle("PATCH /project/webhook", authed(http.HandlerFunc(h.UpdateWebhook)))
 
 	mux.Handle("POST /projects/relayer", authed(http.HandlerFunc(relayerH.RegisterRelayer)))
@@ -144,14 +147,17 @@ func main() {
 	mux.Handle("GET /wallets/{walletId}/balance", authed(http.HandlerFunc(h.GetBalance)))
 	mux.Handle("POST /wallets/{walletId}/broadcast", authed(http.HandlerFunc(h.Broadcast)))
 
-	// ── Admin (X-Admin-Token) ─────────────────────────────────
-	// Manages the stablecoin token registry.
-	// Additionally restrict to internal network at the LB/firewall level in production.
+	// ── Admin (X-Admin-Token) ──────────────────────────────────────────────────
 	mux.Handle("GET /admin/stablecoins", admin(http.HandlerFunc(adminH.ListTokens)))
 	mux.Handle("POST /admin/stablecoins", admin(http.HandlerFunc(adminH.UpsertToken)))
 	mux.Handle("DELETE /admin/stablecoins/{tokenId}", admin(http.HandlerFunc(adminH.DisableToken)))
 
-	// ── HTTP Server ──────────────────────────────────────────
+	// ── Cloud routes (Clerk JWT auth) — only registered when cloud is enabled ──
+	if cfg.Cloud.EnableCloudFeatures {
+		registerCloudRoutes(mux, store, cfg)
+	}
+
+	// ── HTTP Server ───────────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
 		Handler:      mux,
@@ -181,6 +187,72 @@ func main() {
 		log.Fatalf("shutdown error: %v", err)
 	}
 	log.Println("stopped")
+}
+
+// registerCloudRoutes wires all /cloud/* and /webhooks/* routes.
+// Only called when ENABLE_CLOUD_FEATURES=true.
+func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.Config) {
+	cloudH := handlers.NewCloudHandler(store)
+
+	// Clerk JWT middleware (applied individually or composed per route).
+	clerkAuth := middleware.ClerkAuth()
+
+	// Convenience: clerk-authed handler wrapper.
+	clerkAuthed := func(fn http.HandlerFunc) http.Handler {
+		return clerkAuth(http.HandlerFunc(fn))
+	}
+
+	// OrgAuthz requires ClerkAuth to have run first (extracts clerk_user_id).
+	// These helpers compose both middlewares.
+	orgViewer := func(fn http.HandlerFunc) http.Handler {
+		return clerkAuth(middleware.OrgAuthz(store, "viewer")(http.HandlerFunc(fn)))
+	}
+	orgDeveloper := func(fn http.HandlerFunc) http.Handler {
+		return clerkAuth(middleware.OrgAuthz(store, "developer")(http.HandlerFunc(fn)))
+	}
+	orgAdmin := func(fn http.HandlerFunc) http.Handler {
+		return clerkAuth(middleware.OrgAuthz(store, "admin")(http.HandlerFunc(fn)))
+	}
+	orgOwner := func(fn http.HandlerFunc) http.Handler {
+		return clerkAuth(middleware.OrgAuthz(store, "owner")(http.HandlerFunc(fn)))
+	}
+
+	// ── Onboarding ─────────────────────────────────────────────────────
+	mux.Handle("POST /cloud/onboarding", clerkAuthed(cloudH.Onboarding))
+
+	// ── Organizations ──────────────────────────────────────────────────
+	mux.Handle("GET /cloud/organizations", clerkAuthed(cloudH.ListOrganizations))
+	mux.Handle("GET /cloud/organizations/{org_id}", orgViewer(cloudH.GetOrganization))
+	mux.Handle("PATCH /cloud/organizations/{org_id}", orgAdmin(cloudH.UpdateOrganization))
+	mux.Handle("DELETE /cloud/organizations/{org_id}", orgOwner(cloudH.DeleteOrganization))
+
+	// ── Members ────────────────────────────────────────────────────────
+	mux.Handle("GET /cloud/organizations/{org_id}/members", orgViewer(cloudH.ListMembers))
+	mux.Handle("PATCH /cloud/organizations/{org_id}/members/{clerk_user_id}", orgAdmin(cloudH.UpdateMember))
+	mux.Handle("DELETE /cloud/organizations/{org_id}/members/{clerk_user_id}", orgAdmin(cloudH.RemoveMember))
+
+	// ── Invites ────────────────────────────────────────────────────────
+	mux.Handle("POST /cloud/organizations/{org_id}/invites", orgAdmin(cloudH.CreateInvite))
+	mux.Handle("GET /cloud/organizations/{org_id}/invites", orgViewer(cloudH.ListInvites))
+	mux.Handle("DELETE /cloud/organizations/{org_id}/invites/{token}", orgAdmin(cloudH.RevokeInvite))
+
+	// Accept invite — requires Clerk auth but not org membership (they're joining).
+	mux.Handle("POST /cloud/invites/{token}/accept", clerkAuthed(cloudH.AcceptInvite))
+
+	// ── API Keys ───────────────────────────────────────────────────────
+	// Admin can create/revoke; developer/viewer can list (read-only).
+	mux.Handle("POST /cloud/organizations/{org_id}/api-keys", orgAdmin(cloudH.CreateAPIKey))
+	mux.Handle("GET /cloud/organizations/{org_id}/api-keys", orgDeveloper(cloudH.ListAPIKeys))
+	mux.Handle("DELETE /cloud/organizations/{org_id}/api-keys/{key_id}", orgAdmin(cloudH.RevokeAPIKey))
+
+	// ── Clerk Webhooks (public — verified via Svix signature) ───────────
+	webhookH, err := handlers.NewWebhookHandler(store, cfg.Cloud.ClerkWebhookSecret)
+	if err != nil {
+		log.Fatalf("init clerk webhook handler: %v", err)
+	}
+	mux.Handle("POST /webhooks/clerk", webhookH)
+
+	log.Println("cloud routes: registered")
 }
 
 func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) {

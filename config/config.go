@@ -18,6 +18,7 @@ type Config struct {
 	Redis       RedisConfig
 	Worker      WorkerConfig
 	RPC         RPCConfig
+	Cloud       CloudConfig
 }
 
 type KMSConfig struct {
@@ -65,6 +66,17 @@ type RPCConfig struct {
 	SolanaEndpoint string
 }
 
+// CloudConfig holds all Clerk / SaaS multi-tenant configuration.
+// Only required when EnableCloudFeatures = true.
+type CloudConfig struct {
+	EnableCloudFeatures bool
+
+	// Clerk credentials — all required when cloud is enabled.
+	ClerkSecretKey      string
+	ClerkPublishableKey string
+	ClerkWebhookSecret  string
+}
+
 func Load() (*Config, error) {
 	provider := getEnv("KMS_PROVIDER", "vault")
 
@@ -72,6 +84,32 @@ func Load() (*Config, error) {
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
 		return nil, fmt.Errorf("ADMIN_TOKEN env var is required — set a strong random value to protect admin endpoints")
+	}
+
+	enableCloud := getEnvBool("ENABLE_CLOUD_FEATURES", false)
+
+	cloudCfg := CloudConfig{
+		EnableCloudFeatures: enableCloud,
+	}
+
+	if enableCloud {
+		clerkSecret := os.Getenv("CLERK_SECRET_KEY")
+		clerkPublishable := os.Getenv("CLERK_PUBLISHABLE_KEY")
+		clerkWebhook := os.Getenv("CLERK_WEBHOOK_SECRET")
+
+		if clerkSecret == "" {
+			return nil, fmt.Errorf("CLERK_SECRET_KEY is required when ENABLE_CLOUD_FEATURES=true")
+		}
+		if clerkPublishable == "" {
+			return nil, fmt.Errorf("CLERK_PUBLISHABLE_KEY is required when ENABLE_CLOUD_FEATURES=true")
+		}
+		if clerkWebhook == "" {
+			return nil, fmt.Errorf("CLERK_WEBHOOK_SECRET is required when ENABLE_CLOUD_FEATURES=true")
+		}
+
+		cloudCfg.ClerkSecretKey = clerkSecret
+		cloudCfg.ClerkPublishableKey = clerkPublishable
+		cloudCfg.ClerkWebhookSecret = clerkWebhook
 	}
 
 	cfg := &Config{
@@ -94,6 +132,7 @@ func Load() (*Config, error) {
 			EVMEndpoints:   loadEVMEndpoints(),
 			SolanaEndpoint: getEnv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
 		},
+		Cloud: cloudCfg,
 	}
 
 	switch provider {
@@ -198,4 +237,16 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
