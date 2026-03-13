@@ -20,6 +20,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/ratelimit"
 	"github.com/vaultkey/vaultkey/internal/relayer"
 	"github.com/vaultkey/vaultkey/internal/rpc"
+	"github.com/vaultkey/vaultkey/internal/stablecoin"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"github.com/vaultkey/vaultkey/internal/sweep"
 	"github.com/vaultkey/vaultkey/internal/wallet"
@@ -55,7 +56,7 @@ func main() {
 	}
 	defer store.Close()
 
-	// ── Redis + Queue ────────────────────────────────────────
+	// ── Redis ────────────────────────────────────────────────
 	q, err := queue.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		log.Fatalf("connect redis: %v", err)
@@ -63,7 +64,7 @@ func main() {
 	defer q.Close()
 	log.Println("redis: connected")
 
-	// ── Shared Redis client (rate limiter + nonce manager) ───
+	// Shared Redis client — rate limiter, nonce manager, and registry cache.
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
 		Password: cfg.Redis.Password,
@@ -79,15 +80,15 @@ func main() {
 	relayerSvc := relayer.New(store, walletSvc, rpcMgr, nonceMgr)
 	sweepSvc := sweep.New(store, walletSvc, rpcMgr, q)
 
+	// Stablecoin registry: DB-backed, Redis-cached.
+	// Shared between the stablecoin service and the admin handler so that
+	// writes via the admin API invalidate the cache the service reads from.
+	registry := stablecoin.NewRegistry(store, redisClient)
+	stablecoinSvc := stablecoin.NewService(store, rpcMgr, q, registry)
+
 	// ── Worker Pool ──────────────────────────────────────────
 	w := worker.New(
-		store,
-		q,
-		walletSvc,
-		relayerSvc,
-		webhookSvc,
-		nonceMgr,
-		rpcMgr,
+		store, q, walletSvc, relayerSvc, webhookSvc, nonceMgr, rpcMgr,
 		cfg.Worker.Concurrency,
 		cfg.Worker.PollTimeoutSec,
 	)
@@ -100,47 +101,55 @@ func main() {
 	h := handlers.New(store, walletSvc, q, rpcMgr)
 	relayerH := handlers.NewRelayerHandler(store, walletSvc, relayerSvc)
 	sweepH := handlers.NewSweepHandler(store, sweepSvc)
+	stablecoinH := handlers.NewStablecoinHandler(stablecoinSvc)
+	adminH := handlers.NewAdminHandler(registry)
+
 	authed := middleware.Auth(store, limiter)
+	admin := middleware.AdminAuth(cfg.AdminToken)
 
 	mux := http.NewServeMux()
 
+	// ── Public ───────────────────────────────────────────────
 	mux.HandleFunc("POST /projects", h.CreateProject)
 	mux.HandleFunc("GET /health", healthHandler(kmsBackend, q))
+	// mux.HandleFunc("GET /stablecoins", stablecoinH.SupportedTokens)
 
+	// ── Project-authed ────────────────────────────────────────
 	mux.Handle("PATCH /project/webhook", authed(http.HandlerFunc(h.UpdateWebhook)))
 
-	// Relayer management
 	mux.Handle("POST /projects/relayer", authed(http.HandlerFunc(relayerH.RegisterRelayer)))
 	mux.Handle("GET /projects/relayer", authed(http.HandlerFunc(relayerH.GetRelayerInfo)))
 	mux.Handle("GET /projects/relayers", authed(http.HandlerFunc(relayerH.ListRelayers)))
 	mux.Handle("DELETE /projects/relayer/{relayerId}", authed(http.HandlerFunc(relayerH.DeactivateRelayer)))
 
-	// Master wallet / sweep config management
 	mux.Handle("POST /projects/master-wallet", authed(http.HandlerFunc(sweepH.ProvisionMasterWallet)))
 	mux.Handle("GET /projects/master-wallet", authed(http.HandlerFunc(sweepH.GetMasterWallet)))
 	mux.Handle("GET /projects/master-wallets", authed(http.HandlerFunc(sweepH.ListMasterWallets)))
 	mux.Handle("PATCH /projects/master-wallet/{configId}", authed(http.HandlerFunc(sweepH.UpdateSweepConfig)))
 
-	// Wallet CRUD
 	mux.Handle("POST /wallets", authed(http.HandlerFunc(h.CreateWallet)))
 	mux.Handle("GET /wallets/{walletId}", authed(http.HandlerFunc(h.GetWallet)))
 	mux.Handle("GET /users/{userId}/wallets", authed(http.HandlerFunc(h.ListUserWallets)))
 
-	// Signing
 	mux.Handle("POST /wallets/{walletId}/sign/transaction/evm", authed(http.HandlerFunc(h.SubmitSignEVMTransaction)))
 	mux.Handle("POST /wallets/{walletId}/sign/message/evm", authed(http.HandlerFunc(h.SubmitSignEVMMessage)))
 	mux.Handle("POST /wallets/{walletId}/sign/transaction/solana", authed(http.HandlerFunc(h.SubmitSignSolanaTransaction)))
 	mux.Handle("POST /wallets/{walletId}/sign/message/solana", authed(http.HandlerFunc(h.SubmitSignSolanaMessage)))
 
-	// Sweep trigger
+	mux.Handle("POST /wallets/{walletId}/stablecoin/transfer/{chainType}", authed(http.HandlerFunc(stablecoinH.Transfer)))
+	mux.Handle("GET /wallets/{walletId}/stablecoin/balance/{chainType}", authed(http.HandlerFunc(stablecoinH.Balance)))
+
 	mux.Handle("POST /wallets/{walletId}/sweep", authed(http.HandlerFunc(sweepH.TriggerSweep)))
-
-	// Jobs
 	mux.Handle("GET /jobs/{jobId}", authed(http.HandlerFunc(h.GetJob)))
-
-	// Balance + broadcast
 	mux.Handle("GET /wallets/{walletId}/balance", authed(http.HandlerFunc(h.GetBalance)))
 	mux.Handle("POST /wallets/{walletId}/broadcast", authed(http.HandlerFunc(h.Broadcast)))
+
+	// ── Admin (X-Admin-Token) ─────────────────────────────────
+	// Manages the stablecoin token registry.
+	// Additionally restrict to internal network at the LB/firewall level in production.
+	mux.Handle("GET /admin/stablecoins", admin(http.HandlerFunc(adminH.ListTokens)))
+	mux.Handle("POST /admin/stablecoins", admin(http.HandlerFunc(adminH.UpsertToken)))
+	mux.Handle("DELETE /admin/stablecoins/{tokenId}", admin(http.HandlerFunc(adminH.DisableToken)))
 
 	// ── HTTP Server ──────────────────────────────────────────
 	srv := &http.Server{
@@ -171,28 +180,20 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("shutdown error: %v", err)
 	}
-
 	log.Println("stopped")
 }
 
 func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) {
 	switch cfg.KMS.Provider {
 	case "vault":
-		return internalkms.NewVault(
-			cfg.Vault.Addr,
-			cfg.Vault.Token,
-			cfg.Vault.MountPath,
-			cfg.Vault.KeyName,
-		), nil
+		return internalkms.NewVault(cfg.Vault.Addr, cfg.Vault.Token, cfg.Vault.MountPath, cfg.Vault.KeyName), nil
 	case "gcp":
 		return internalkms.NewGCP(ctx, cfg.GCP.KeyName, internalkms.GCPOptions{
 			CredentialsJSON: cfg.GCP.CredentialsJSON,
 			CredentialsFile: cfg.GCP.CredentialsFile,
 		})
 	case "aws":
-		return internalkms.NewAWS(ctx, cfg.AWS.KeyID,
-			awscfg.WithRegion(cfg.AWS.Region),
-		)
+		return internalkms.NewAWS(ctx, cfg.AWS.KeyID, awscfg.WithRegion(cfg.AWS.Region))
 	default:
 		return nil, fmt.Errorf("unknown KMS provider: %s", cfg.KMS.Provider)
 	}
@@ -202,16 +203,13 @@ func healthHandler(kms internalkms.KMS, q *queue.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kmsErr := kms.Health(r.Context())
 		redisErr := q.Health(r.Context())
-
 		if kmsErr != nil || redisErr != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
-
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"kms":"%v","redis":"%v"}`,
-			healthStr(kmsErr), healthStr(redisErr))
+		fmt.Fprintf(w, `{"kms":"%v","redis":"%v"}`, healthStr(kmsErr), healthStr(redisErr))
 	}
 }
 
