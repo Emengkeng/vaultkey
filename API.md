@@ -1223,6 +1223,213 @@ curl -X POST http://localhost:8080/wallets/wallet_xyz789/sweep \
 
 ---
 
+---
+
+### Stablecoins
+
+Transfer and query balances for USDC and USDT across EVM chains and Solana. All transfers are asynchronous — the API returns a `job_id` immediately and delivers the result via webhook.
+
+**Supported tokens:** `usdc`, `usdt`
+
+**Supported chains (EVM):**
+| Network | Chain ID |
+|---------|----------|
+| Polygon | 137 |
+| Arbitrum | 42161 |
+| Base | 8453 |
+| Optimism | 10 |
+| BSC | 56 |
+
+**Supported chains (Solana):** Mainnet only — omit `chain_id`.
+
+> **Note:** BSC USDC/USDT use 18 decimals. All other chains use 6.
+
+---
+
+#### Transfer Stablecoin
+
+Transfers a stablecoin from a user wallet to a recipient address. The amount is specified in human-readable form (e.g. `"50.00"`).
+
+**EVM:**
+```http
+POST /wallets/{walletId}/stablecoin/transfer/evm
+```
+
+**Solana:**
+```http
+POST /wallets/{walletId}/stablecoin/transfer/solana
+```
+
+**Authentication:** Required
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `walletId` | string | Wallet ID — must match the chain type in the URL |
+
+**Request Body (EVM):**
+```json
+{
+  "token": "usdc",
+  "to": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
+  "amount": "50.00",
+  "chain_id": "137",
+  "gasless": true,
+  "idempotency_key": "transfer_user123_20260311_001"
+}
+```
+
+**Request Body (Solana):**
+```json
+{
+  "token": "usdc",
+  "to": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+  "amount": "50.00",
+  "idempotency_key": "transfer_user123_sol_001"
+}
+```
+
+**Parameters:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `token` | string | Yes | `usdc` or `usdt` |
+| `to` | string | Yes | Recipient address (`0x...` for EVM, base58 for Solana) |
+| `amount` | string | Yes | Human-readable amount, e.g. `"50.00"` |
+| `chain_id` | string | EVM only | Chain ID — required for EVM, must be omitted for Solana |
+| `gasless` | boolean | EVM only | `true` = relayer pays gas. Solana transfers always require a relayer. |
+| `idempotency_key` | string | No | Deduplication key — safe to retry |
+
+**Response:** `202 Accepted` (new job)
+```json
+{
+  "job_id": "job_abc123",
+  "status": "pending"
+}
+```
+
+**Response:** `200 OK` (idempotency hit — job already in progress or complete)
+```json
+{
+  "job_id": "job_abc123",
+  "status": "completed"
+}
+```
+
+**Webhook result on completion:**
+```json
+{
+  "job_id": "job_abc123",
+  "operation": "sign_tx_evm",
+  "status": "completed",
+  "result": {
+    "tx_hash": "0x1234..."
+  }
+}
+```
+
+**Validation errors returned as `400 Bad Request`:**
+- Token not registered for this chain
+- Wallet chain type doesn't match URL chain type
+- Master wallet attempted as sender
+- Zero or insufficient token balance
+- No relayer configured (gasless or Solana)
+- Relayer balance below minimum (0.05 ETH / 0.05 SOL)
+- Invalid recipient address format
+
+**Prerequisites:**
+- For `gasless: true` (EVM) or any Solana transfer: a relayer wallet must be registered and funded via `POST /projects/relayer`
+- Token must be registered for the target chain (mainnet defaults are pre-seeded; testnets require manual setup via `POST /admin/stablecoins`)
+
+**Example (EVM, gasless):**
+```bash
+curl -X POST http://localhost:8080/wallets/wallet_xyz789/stablecoin/transfer/evm \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..." \
+  -d '{
+    "token": "usdc",
+    "to": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
+    "amount": "50.00",
+    "chain_id": "137",
+    "gasless": true,
+    "idempotency_key": "transfer_user123_20260311_001"
+  }'
+```
+
+**Example (Solana):**
+```bash
+curl -X POST http://localhost:8080/wallets/wallet_sol123/stablecoin/transfer/solana \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..." \
+  -d '{
+    "token": "usdc",
+    "to": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+    "amount": "50.00",
+    "idempotency_key": "transfer_user123_sol_001"
+  }'
+```
+
+---
+
+#### Get Stablecoin Balance
+
+Returns the token balance for a wallet on a specific chain.
+
+**EVM:**
+```http
+GET /wallets/{walletId}/stablecoin/balance/evm
+```
+
+**Solana:**
+```http
+GET /wallets/{walletId}/stablecoin/balance/solana
+```
+
+**Authentication:** Required
+
+**Query Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `token` | string | Yes | `usdc` or `usdt` |
+| `chain_id` | string | EVM only | Chain ID — required for EVM, omit for Solana |
+
+**Response:** `200 OK`
+```json
+{
+  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
+  "token": "usdc",
+  "symbol": "USDC",
+  "balance": "50.000000",
+  "raw_balance": "50000000",
+  "chain_id": "137"
+}
+```
+
+**Fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `address` | string | Wallet address |
+| `token` | string | Token identifier |
+| `symbol` | string | Display symbol (e.g. `USDC`) |
+| `balance` | string | Human-readable balance |
+| `raw_balance` | string | Balance in base units (for precision-sensitive use) |
+| `chain_id` | string | EVM only — omitted for Solana |
+
+**Example (EVM):**
+```bash
+curl -X GET "http://localhost:8080/wallets/wallet_xyz789/stablecoin/balance/evm?token=usdc&chain_id=137" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..."
+```
+
+**Example (Solana):**
+```bash
+curl -X GET "http://localhost:8080/wallets/wallet_sol123/stablecoin/balance/solana?token=usdc" \
+  -H "X-API-Key: vk_live_..." \
+  -H "X-API-Secret: vk_secret_..."
+```
+
 ### Health Check
 
 #### System Health
@@ -1371,6 +1578,54 @@ app.post('/webhooks/vaultkey', express.json(), (req, res) => {
 ---
 
 ## Code Examples
+
+### Stablecoin Transfer (Node.js)
+```javascript
+const axios = require('axios');
+
+const client = axios.create({
+  baseURL: 'http://localhost:8080',
+  headers: { 'X-API-Key': 'vk_live_...', 'X-API-Secret': 'vk_secret_...' }
+});
+
+async function transferUSDC(walletId, recipient, amount) {
+  // 1. Check balance before submitting
+  const { data: bal } = await client.get(
+    `/wallets/${walletId}/stablecoin/balance/evm`,
+    { params: { token: 'usdc', chain_id: '137' } }
+  );
+  console.log(`Current balance: ${bal.balance} USDC`);
+
+  // 2. Submit transfer
+  const { data: job } = await client.post(
+    `/wallets/${walletId}/stablecoin/transfer/evm`,
+    {
+      token: 'usdc',
+      to: recipient,
+      amount,
+      chain_id: '137',
+      gasless: true,
+      idempotency_key: `transfer_${walletId}_${Date.now()}`
+    }
+  );
+  console.log('Job submitted:', job.job_id);
+
+  // 3. Poll for result (prefer webhooks in production)
+  while (true) {
+    const { data: status } = await client.get(`/jobs/${job.job_id}`);
+    if (status.status === 'completed') {
+      console.log('Transfer complete. Tx hash:', status.result.tx_hash);
+      return status.result;
+    }
+    if (status.status === 'failed' || status.status === 'dead') {
+      throw new Error(`Transfer failed: ${status.error}`);
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+transferUSDC('wallet_xyz789', '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb', '50.00');
+```
 
 ### Complete Workflow (Node.js)
 
@@ -1603,6 +1858,18 @@ while True:
 - Vault needs unsealing
 - Redis connection lost
 - Database unavailable
+
+**400 Bad Request — insufficient balance**
+```json
+{"error": "insufficient usdc balance: wallet has 10.00 but transfer requires 50.00"}
+```
+- Wallet token balance is below the requested transfer amount
+
+**400 Bad Request — token not registered**
+```json
+{"error": "usdc not registered for evm chain 80001 — seed it via POST /admin/stablecoins"}
+```
+- Token hasn't been configured for this chain (common on testnets)
 
 ### Retry Logic
 
