@@ -40,14 +40,6 @@ func (h *CloudHandler) writeError(w http.ResponseWriter, status int, msg string)
 	h.writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func generateToken(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
-
 // slugify converts a string to a URL-safe slug.
 func slugify(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))

@@ -150,17 +150,17 @@ CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(org_id) WHERE deleted_at
 -- After all clients migrate you can drop api_key/api_secret_hash from projects.
 -- =============================================================================
 
-INSERT INTO api_keys (project_id, name, key, secret_hash, created_by, active)
-SELECT
-    p.id,
-    'Legacy Key',
-    p.api_key,
-    p.api_secret_hash,
-    NULL,
-    true
-FROM projects p
-WHERE p.api_key IS NOT NULL
-  AND p.api_secret_hash IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM api_keys ak WHERE ak.project_id = p.id AND ak.key = p.api_key
-  );
+-- INSERT INTO api_keys (project_id, name, key, secret_hash, created_by, active)
+-- SELECT
+--     p.id,
+--     'Legacy Key',
+--     p.api_key,
+--     p.api_secret_hash,
+--     NULL,
+--     true
+-- FROM projects p
+-- WHERE p.api_key IS NOT NULL
+--   AND p.api_secret_hash IS NOT NULL
+--   AND NOT EXISTS (
+--       SELECT 1 FROM api_keys ak WHERE ak.project_id = p.id AND ak.key = p.api_key
+--   );
