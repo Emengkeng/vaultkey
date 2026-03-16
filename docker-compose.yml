@@ -110,13 +110,13 @@ services:
       WORKER_POLL_TIMEOUT_SEC: 5
 
       # EVM RPC endpoints
-      EVM_RPC_1: ${EVM_RPC_1:-https://cloudflare-eth.com}
-      EVM_RPC_137: ${EVM_RPC_137:-https://polygon-rpc.com}
-      EVM_RPC_42161: ${EVM_RPC_42161:-https://arb1.arbitrum.io/rpc}
-      EVM_RPC_8453: ${EVM_RPC_8453:-https://mainnet.base.org}
-      EVM_RPC_10: ${EVM_RPC_10:-https://mainnet.optimism.io}
+      EVM_RPC_11155111: ${EVM_RPC_1:-https://eth-sepolia.public.blastapi.io}
+      EVM_RPC_80001: ${EVM_RPC_137:-https://rpc-mumbai.maticvigil.com}
+      EVM_RPC_421614: ${EVM_RPC_42161:-https://sepolia-rollup.arbitrum.io/rpc}
+      EVM_RPC_84532: ${EVM_RPC_8453:-https://sepolia.base.org}
+      EVM_RPC_11155420: ${EVM_RPC_10:-https://sepolia.optimism.io}
 
-      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.devnet.solana.com}
     ports:
       - "8080:8080"
     volumes:
