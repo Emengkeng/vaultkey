@@ -54,6 +54,21 @@ docker compose up -d
 
 **First run takes ~2 minutes** (downloading images)
 
+## Troubleshooting
+ 
+### Vault permission errors
+ 
+If you see `permission denied` errors from Vault:
+ 
+```bash
+# Fix vault volume permissions manually
+sudo chown -R 100:100 /var/lib/docker/volumes/vaultkey_vault_data/_data
+ 
+# Restart
+docker compose down
+docker compose up -d
+```
+
 ### 4. Check Vault Keys (IMPORTANT!)
 
 ```bash

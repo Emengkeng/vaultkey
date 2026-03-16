@@ -16,6 +16,7 @@
 coverage.*
 *.coverprofile
 profile.cov
+docker-compose.yml.backup
 
 # Dependency directories (remove the comment below to include it)
 # vendor/

@@ -33,11 +33,10 @@ import (
 )
 
 func main() {
-	err := godotenv.Load()
-    if err != nil {
-        log.Fatal("Error loading .env file")
-    }
-	
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables from system")
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("load config: %v", err)

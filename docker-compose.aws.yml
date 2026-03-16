@@ -1,5 +1,3 @@
-version: "3.9"
-
 # docker-compose.aws.yml
 #
 # Use this instead of docker-compose.yml when running on AWS.

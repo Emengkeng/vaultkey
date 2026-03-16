@@ -10,14 +10,16 @@
 
 set -e
 
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+VAULT_ADDR="${VAULT_ADDR:-http://vault:8200}"
 INIT_FILE="/vault/data/init.json"
 MAX_RETRIES=30
 
 wait_for_vault() {
   echo "Waiting for Vault to start..."
   i=0
-  until curl -sf "${VAULT_ADDR}/v1/sys/health" > /dev/null 2>&1 || [ $i -ge $MAX_RETRIES ]; do
+  # Use query params to make health endpoint return 200 even when sealed/uninitialized
+  until curl -sf "${VAULT_ADDR}/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200" > /dev/null 2>&1 || [ $i -ge $MAX_RETRIES ]; do
+    echo "  Attempt $((i+1))/$MAX_RETRIES..."
     sleep 1
     i=$((i+1))
   done
@@ -32,11 +34,21 @@ init_vault() {
   echo "Initializing Vault..."
   # 3 key shares, threshold of 2
   # For customer-managed unseal: operator provides their own KMS here
+  
+  echo "DEBUG: Attempting to initialize vault at ${VAULT_ADDR}/v1/sys/init"
   INIT_RESPONSE=$(curl -sf \
     --request POST \
     --data '{"secret_shares": 3, "secret_threshold": 2}' \
-    "${VAULT_ADDR}/v1/sys/init")
-
+    "${VAULT_ADDR}/v1/sys/init" 2>&1)
+  
+  CURL_EXIT=$?
+  if [ $CURL_EXIT -ne 0 ]; then
+    echo "ERROR: Vault initialization failed with exit code $CURL_EXIT"
+    echo "Response: $INIT_RESPONSE"
+    exit 1
+  fi
+  
+  echo "DEBUG: Initialization response received, saving to $INIT_FILE"
   echo "$INIT_RESPONSE" > "$INIT_FILE"
   chmod 600 "$INIT_FILE"
 
@@ -119,7 +131,9 @@ enable_transit() {
 main() {
   wait_for_vault
 
+  echo "DEBUG: Checking if Vault is initialized..."
   INIT_STATUS=$(curl -sf "${VAULT_ADDR}/v1/sys/init" | python3 -c "import json,sys; print(json.load(sys.stdin)['initialized'])")
+  echo "DEBUG: Vault initialized status: $INIT_STATUS"
 
   if [ "$INIT_STATUS" = "False" ]; then
     init_vault
@@ -127,7 +141,9 @@ main() {
     echo "Vault already initialized"
   fi
 
+  echo "DEBUG: Checking if Vault is sealed..."
   SEAL_STATUS=$(curl -sf "${VAULT_ADDR}/v1/sys/seal-status" | python3 -c "import json,sys; print(json.load(sys.stdin)['sealed'])")
+  echo "DEBUG: Vault sealed status: $SEAL_STATUS"
 
   if [ "$SEAL_STATUS" = "True" ]; then
     unseal_vault
