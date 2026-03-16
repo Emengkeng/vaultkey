@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/clerk/clerk-sdk-go/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/vaultkey/vaultkey/config"
@@ -32,6 +33,11 @@ import (
 )
 
 func main() {
+	err := godotenv.Load()
+    if err != nil {
+        log.Fatal("Error loading .env file")
+    }
+	
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
