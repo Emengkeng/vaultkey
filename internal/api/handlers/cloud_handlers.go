@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/vaultkey/vaultkey/config"
 	"github.com/vaultkey/vaultkey/internal/api/middleware"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"golang.org/x/crypto/bcrypt"
@@ -22,10 +23,11 @@ var clerkUserIDRe = regexp.MustCompile(`^user_[a-zA-Z0-9]+$`)
 type CloudHandler struct {
 	store *storage.Store
 	redisClient *redis.Client
+	config *config.Config
 }
 
-func NewCloudHandler(store *storage.Store, redisClient *redis.Client) *CloudHandler {
-	return &CloudHandler{store: store, redisClient: redisClient}
+func NewCloudHandler(store *storage.Store, redisClient *redis.Client, cfg *config.Config) *CloudHandler {
+	return &CloudHandler{store: store, redisClient: redisClient, config: cfg}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -575,17 +577,32 @@ func (h *CloudHandler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.config.Environment == "testnet" {
+        existingKeys, _ := h.store.ListAPIKeys(r.Context(), proj.ID)
+        if len(existingKeys) >= h.config.Cloud.MaxAPIKeysPerProject {
+            h.writeError(w, http.StatusForbidden, 
+                fmt.Sprintf("testnet projects are limited to %d API keys - upgrade to mainnet for unlimited keys", 
+                    h.config.Cloud.MaxAPIKeysPerProject))
+            return
+        }
+    }
+
 	// Generate key pair.
-	key, err := generateToken(32)
+	prefix := getKeyPrefix(h.config.Environment)
+	token, err := generateToken(32)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	secret, err := generateToken(32)
+	key := prefix + token
+	
+	secretToken, err := generateToken(32)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	secret := prefix + secretToken
+
 	hash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal error")
@@ -665,4 +682,11 @@ func (h *CloudHandler) RevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	storage.InvalidateAPIKeyCache(r.Context(), h.redisClient, rawKey)
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": keyID})
+}
+
+func getKeyPrefix(env string) string {
+    if env == "testnet" {
+        return "testnet_"
+    }
+    return "vk_live_"
 }

@@ -192,7 +192,7 @@ func main() {
 // registerCloudRoutes wires all /cloud/* and /webhooks/* routes.
 // Only called when ENABLE_CLOUD_FEATURES=true.
 func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.Config, redisClient *redis.Client) {
-	cloudH := handlers.NewCloudHandler(store, redisClient)
+	cloudH := handlers.NewCloudHandler(store, redisClient, cfg)
 
 	// Clerk JWT middleware (applied individually or composed per route).
 	clerkAuth := middleware.ClerkAuth()

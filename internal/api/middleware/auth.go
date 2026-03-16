@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/clerk/clerk-sdk-go/v2"
 	clerkhttp "github.com/clerk/clerk-sdk-go/v2/http"
+	"github.com/redis/go-redis/v9"
 	"github.com/vaultkey/vaultkey/internal/ratelimit"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"golang.org/x/crypto/bcrypt"
-	"github.com/redis/go-redis/v9"
 )
 
 // ── Context keys ──────────────────────────────────────────────────────────────
@@ -39,6 +40,18 @@ func Auth(store *storage.Store, limiter *ratelimit.Limiter, redisClient *redis.C
 				writeError(w, http.StatusUnauthorized, "missing X-API-Key or X-API-Secret")
 				return
 			}
+
+			if strings.HasPrefix(apiKey, "testnet_") && os.Getenv("ENVIRONMENT") == "mainnet" {
+                writeError(w, http.StatusUnauthorized, 
+                    "testnet API key cannot be used on mainnet - switch to testnet")
+                return
+            }
+
+			if strings.HasPrefix(apiKey, "vk_live_") && os.Getenv("ENVIRONMENT") == "testnet" {
+                writeError(w, http.StatusUnauthorized, 
+                    "mainnet API key cannot be used on testnet - switch to mainnet")
+                return
+            }
 
 			ak, project, err := store.GetAPIKeyByKeyCached(r.Context(), redisClient, apiKey)
 			if err != nil {

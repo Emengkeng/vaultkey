@@ -8,6 +8,7 @@ import (
 )
 
 type Config struct {
+	Environment string // "testnet" | "mainnet"
 	Port        string
 	DatabaseURL string
 	AdminToken  string
@@ -75,6 +76,11 @@ type CloudConfig struct {
 	ClerkSecretKey      string
 	ClerkPublishableKey string
 	ClerkWebhookSecret  string
+
+	// Testnet-specific limits (only used when Environment="testnet")
+    MaxProjectsPerOrg  int // e.g., 2
+    MaxMembersPerOrg   int // e.g., 3
+    MaxAPIKeysPerProject int // e.g., 3
 }
 
 func Load() (*Config, error) {
@@ -86,11 +92,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ADMIN_TOKEN env var is required — set a strong random value to protect admin endpoints")
 	}
 
+	env := getEnv("ENVIRONMENT", "mainnet")
 	enableCloud := getEnvBool("ENABLE_CLOUD_FEATURES", false)
 
 	cloudCfg := CloudConfig{
 		EnableCloudFeatures: enableCloud,
 	}
+
+	if env == "testnet" && enableCloud {
+        cloudCfg.MaxProjectsPerOrg = getEnvInt("TESTNET_MAX_PROJECTS", 2)
+        cloudCfg.MaxMembersPerOrg = getEnvInt("TESTNET_MAX_MEMBERS", 3)
+        cloudCfg.MaxAPIKeysPerProject = getEnvInt("TESTNET_MAX_API_KEYS", 3)
+    }
 
 	if enableCloud {
 		clerkSecret := os.Getenv("CLERK_SECRET_KEY")
@@ -132,6 +145,7 @@ func Load() (*Config, error) {
 			EVMEndpoints:   loadEVMEndpoints(),
 			SolanaEndpoint: getEnv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
 		},
+		Environment: env,
 		Cloud: cloudCfg,
 	}
 
