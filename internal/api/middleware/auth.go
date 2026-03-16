@@ -11,6 +11,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/ratelimit"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"golang.org/x/crypto/bcrypt"
+	"github.com/redis/go-redis/v9"
 )
 
 // ── Context keys ──────────────────────────────────────────────────────────────
@@ -28,7 +29,7 @@ const (
 // Auth validates X-API-Key and X-API-Secret against the api_keys table,
 // then checks per-project rate limit.
 // Supports both legacy (api_key on projects table, migrated) and new multi-key model.
-func Auth(store *storage.Store, limiter *ratelimit.Limiter) func(http.Handler) http.Handler {
+func Auth(store *storage.Store, limiter *ratelimit.Limiter, redisClient *redis.Client) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiKey := r.Header.Get("X-API-Key")
@@ -39,7 +40,7 @@ func Auth(store *storage.Store, limiter *ratelimit.Limiter) func(http.Handler) h
 				return
 			}
 
-			ak, project, err := store.GetAPIKeyByKey(r.Context(), apiKey)
+			ak, project, err := store.GetAPIKeyByKeyCached(r.Context(), redisClient, apiKey)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "internal error")
 				return

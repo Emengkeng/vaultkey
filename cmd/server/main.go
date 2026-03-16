@@ -108,7 +108,7 @@ func main() {
 	stablecoinH := handlers.NewStablecoinHandler(stablecoinSvc)
 	adminH := handlers.NewAdminHandler(registry)
 
-	authed := middleware.Auth(store, limiter)
+	authed := middleware.Auth(store, limiter, redisClient)
 	admin := middleware.AdminAuth(cfg.AdminToken)
 
 	mux := http.NewServeMux()
@@ -154,7 +154,7 @@ func main() {
 
 	// ── Cloud routes (Clerk JWT auth) — only registered when cloud is enabled ──
 	if cfg.Cloud.EnableCloudFeatures {
-		registerCloudRoutes(mux, store, cfg)
+		registerCloudRoutes(mux, store, cfg, redisClient)
 	}
 
 	// ── HTTP Server ───────────────────────────────────────────────────────────
@@ -191,8 +191,8 @@ func main() {
 
 // registerCloudRoutes wires all /cloud/* and /webhooks/* routes.
 // Only called when ENABLE_CLOUD_FEATURES=true.
-func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.Config) {
-	cloudH := handlers.NewCloudHandler(store)
+func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.Config, redisClient *redis.Client) {
+	cloudH := handlers.NewCloudHandler(store, redisClient)
 
 	// Clerk JWT middleware (applied individually or composed per route).
 	clerkAuth := middleware.ClerkAuth()

@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +12,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/api/middleware"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"golang.org/x/crypto/bcrypt"
+	"github.com/redis/go-redis/v9"
 )
 
 // clerkUserIDRe validates Clerk user ID format.
@@ -22,10 +21,11 @@ var clerkUserIDRe = regexp.MustCompile(`^user_[a-zA-Z0-9]+$`)
 // CloudHandler handles all /cloud/* endpoints.
 type CloudHandler struct {
 	store *storage.Store
+	redisClient *redis.Client
 }
 
-func NewCloudHandler(store *storage.Store) *CloudHandler {
-	return &CloudHandler{store: store}
+func NewCloudHandler(store *storage.Store, redisClient *redis.Client) *CloudHandler {
+	return &CloudHandler{store: store, redisClient: redisClient}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -655,10 +655,14 @@ func (h *CloudHandler) RevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.RevokeAPIKey(r.Context(), proj.ID, keyID); err != nil {
+	rawKey, err := h.store.RevokeAPIKey(r.Context(), proj.ID, keyID)
+	if err != nil {
 		h.writeError(w, http.StatusNotFound, "api key not found: "+err.Error())
 		return
 	}
+
+	// Invalidate cache immediately so revocation takes effect before TTL.
+	storage.InvalidateAPIKeyCache(r.Context(), h.redisClient, rawKey)
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": keyID})
 }

@@ -526,20 +526,33 @@ func (s *Store) ListAPIKeys(ctx context.Context, projectID string) ([]*APIKey, e
 	return keys, rows.Err()
 }
 
-func (s *Store) RevokeAPIKey(ctx context.Context, projectID, keyID string) error {
+// RevokeAPIKey deactivates a key and returns the raw key string for cache invalidation.
+func (s *Store) RevokeAPIKey(ctx context.Context, projectID, keyID string) (string, error) {
+	var rawKey string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT key FROM api_keys WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+		keyID, projectID,
+	).Scan(&rawKey)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("api key not found")
+	}
+	if err != nil {
+		return "", fmt.Errorf("revoke api key: %w", err)
+	}
+
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE api_keys SET active = false, deleted_at = now()
 		 WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
 		keyID, projectID,
 	)
 	if err != nil {
-		return fmt.Errorf("revoke api key: %w", err)
+		return "", fmt.Errorf("revoke api key: %w", err)
 	}
 	n, _ := result.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("api key not found")
+		return "", fmt.Errorf("api key not found")
 	}
-	return nil
+	return rawKey, nil
 }
 
 // EnsureProjectForOrg creates a project for an org if none exists.
