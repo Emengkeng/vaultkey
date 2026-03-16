@@ -117,6 +117,18 @@ services:
       EVM_RPC_11155420: ${EVM_RPC_10:-https://sepolia.optimism.io}
 
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.devnet.solana.com}
+
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      ENVIRONMENT: ${ENVIRONMENT:-testnet}
+      ENABLE_CLOUD_FEATURES: ${ENABLE_CLOUD_FEATURES:-false}
+      TESTNET_MAX_PROJECTS: ${TESTNET_MAX_PROJECTS:-2}
+      TESTNET_MAX_MEMBERS: ${TESTNET_MAX_MEMBERS:-3}
+      TESTNET_MAX_API_KEYS: ${TESTNET_MAX_API_KEYS:-3}
+
+      # Clerk authentication (required if ENABLE_CLOUD_FEATURES=true)
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+      CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY}
+      CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET}
     ports:
       - "8080:8080"
     volumes:
