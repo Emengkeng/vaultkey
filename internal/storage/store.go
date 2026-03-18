@@ -41,17 +41,32 @@ type Project struct {
 	WebhookSecret *string
 	RateLimitRPS  int
 	MaxRetries    int
+	CloudManaged bool
+	OrgID        *string
 	CreatedAt     time.Time
 }
 
-func (s *Store) CreateProject(ctx context.Context, name, apiKey, apiSecretHash string, webhookURL, webhookSecret *string, rateLimitRPS, maxRetries int) (*Project, error) {
+func (s *Store) CreateProject(
+	ctx context.Context,
+	name, apiKey, apiSecretHash string,
+	webhookURL, webhookSecret *string,
+	rateLimitRPS, maxRetries int,
+) (*Project, error) {
 	p := &Project{}
 	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO projects (name, api_key, api_secret_hash, webhook_url, webhook_secret, rate_limit_rps, max_retries)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 RETURNING id, name, api_key, api_secret_hash, webhook_url, webhook_secret, rate_limit_rps, max_retries, created_at`,
+		`INSERT INTO projects
+		    (name, api_key, api_secret_hash, webhook_url, webhook_secret,
+		     rate_limit_rps, max_retries, cloud_managed, org_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, false, NULL)
+		 RETURNING id, name, api_key, api_secret_hash, webhook_url, webhook_secret,
+		           rate_limit_rps, max_retries, cloud_managed, org_id, created_at`,
 		name, apiKey, apiSecretHash, webhookURL, webhookSecret, rateLimitRPS, maxRetries,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.APISecretHash, &p.WebhookURL, &p.WebhookSecret, &p.RateLimitRPS, &p.MaxRetries, &p.CreatedAt)
+	).Scan(
+		&p.ID, &p.Name, &p.APIKey, &p.APISecretHash,
+		&p.WebhookURL, &p.WebhookSecret,
+		&p.RateLimitRPS, &p.MaxRetries,
+		&p.CloudManaged, &p.OrgID, &p.CreatedAt,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create project: %w", err)
 	}
@@ -61,15 +76,22 @@ func (s *Store) CreateProject(ctx context.Context, name, apiKey, apiSecretHash s
 func (s *Store) GetProjectByAPIKey(ctx context.Context, apiKey string) (*Project, error) {
 	p := &Project{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, api_key, api_secret_hash, webhook_url, webhook_secret, rate_limit_rps, max_retries, created_at
-		 FROM projects WHERE api_key = $1`,
+		`SELECT id, name, api_key, api_secret_hash, webhook_url, webhook_secret,
+		        rate_limit_rps, max_retries, cloud_managed, org_id, created_at
+		 FROM projects
+		 WHERE api_key = $1 AND deleted_at IS NULL`,
 		apiKey,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.APISecretHash, &p.WebhookURL, &p.WebhookSecret, &p.RateLimitRPS, &p.MaxRetries, &p.CreatedAt)
+	).Scan(
+		&p.ID, &p.Name, &p.APIKey, &p.APISecretHash,
+		&p.WebhookURL, &p.WebhookSecret,
+		&p.RateLimitRPS, &p.MaxRetries,
+		&p.CloudManaged, &p.OrgID, &p.CreatedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get project: %w", err)
+		return nil, fmt.Errorf("get project by api key: %w", err)
 	}
 	return p, nil
 }
@@ -77,10 +99,17 @@ func (s *Store) GetProjectByAPIKey(ctx context.Context, apiKey string) (*Project
 func (s *Store) GetProjectByID(ctx context.Context, projectID string) (*Project, error) {
 	p := &Project{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, api_key, api_secret_hash, webhook_url, webhook_secret, rate_limit_rps, max_retries, created_at
-		 FROM projects WHERE id = $1`,
+		`SELECT id, name, api_key, api_secret_hash, webhook_url, webhook_secret,
+		        rate_limit_rps, max_retries, cloud_managed, org_id, created_at
+		 FROM projects
+		 WHERE id = $1 AND deleted_at IS NULL`,
 		projectID,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.APISecretHash, &p.WebhookURL, &p.WebhookSecret, &p.RateLimitRPS, &p.MaxRetries, &p.CreatedAt)
+	).Scan(
+		&p.ID, &p.Name, &p.APIKey, &p.APISecretHash,
+		&p.WebhookURL, &p.WebhookSecret,
+		&p.RateLimitRPS, &p.MaxRetries,
+		&p.CloudManaged, &p.OrgID, &p.CreatedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -92,7 +121,9 @@ func (s *Store) GetProjectByID(ctx context.Context, projectID string) (*Project,
 
 func (s *Store) UpdateProjectWebhook(ctx context.Context, projectID string, webhookURL, webhookSecret *string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE projects SET webhook_url = $1, webhook_secret = $2 WHERE id = $3`,
+		`UPDATE projects
+		 SET webhook_url = $1, webhook_secret = $2
+		 WHERE id = $3 AND deleted_at IS NULL`,
 		webhookURL, webhookSecret, projectID,
 	)
 	return err

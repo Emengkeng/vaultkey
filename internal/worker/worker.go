@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vaultkey/vaultkey/internal/credits"
 	"github.com/vaultkey/vaultkey/internal/nonce"
 	"github.com/vaultkey/vaultkey/internal/queue"
 	"github.com/vaultkey/vaultkey/internal/relayer"
@@ -25,6 +26,7 @@ type Worker struct {
 	webhookSvc  *webhook.Deliverer
 	nonceMgr    *nonce.Manager
 	rpcMgr      *rpc.Manager
+	creditsMgr *credits.Manager
 	concurrency int
 	pollTimeout int
 }
@@ -37,6 +39,7 @@ func New(
 	webhookSvc *webhook.Deliverer,
 	nonceMgr *nonce.Manager,
 	rpcMgr *rpc.Manager,
+	creditsMgr *credits.Manager,
 	concurrency, pollTimeout int,
 ) *Worker {
 	return &Worker{
@@ -48,6 +51,7 @@ func New(
 		nonceMgr:    nonceMgr,
 		rpcMgr:      rpcMgr,
 		concurrency: concurrency,
+		creditsMgr: creditsMgr,
 		pollTimeout: pollTimeout,
 	}
 }
@@ -132,7 +136,7 @@ func (w *Worker) processJob(ctx context.Context, qJob *queue.Job) error {
 
 	if signingErr != nil {
 		w.handleJobFailure(ctx, qJob, dbJob, signingErr.Error())
-		w.deliverWebhook(ctx, proj, dbJob, nil, signingErr.Error())
+		w.dispatchWebhook(ctx, proj, dbJob, nil, signingErr.Error())
 		return nil
 	}
 
@@ -149,7 +153,7 @@ func (w *Worker) processJob(ctx context.Context, qJob *queue.Job) error {
 		"status": "completed",
 	})
 
-	w.deliverWebhook(ctx, proj, dbJob, result, "")
+	w.dispatchWebhook(ctx, proj, dbJob, result, "")
 
 	return nil
 }
@@ -401,6 +405,72 @@ func (w *Worker) handleJobFailure(ctx context.Context, qJob *queue.Job, dbJob *s
 		w.store.MarkJobFailed(ctx, dbJob.ID, reason) //nolint:errcheck
 		w.queue.Requeue(ctx, *qJob)                  //nolint:errcheck
 	}
+}
+
+// dispatchWebhook routes to the correct delivery path based on
+// whether the project is cloud-managed.
+//
+// Self-hosted (cloud_managed=false): direct webhook delivery, unchanged.
+// Cloud-managed (cloud_managed=true): settleAndDeliver handles post-job
+//   work (usage recording, future: gas settlement) before relaying the
+//   webhook to the merchant's configured URL.
+func (w *Worker) dispatchWebhook(
+	ctx context.Context,
+	proj *storage.Project,
+	job *storage.SigningJob,
+	result *signingResult,
+	errMsg string,
+) {
+	if proj.CloudManaged {
+		w.settleAndDeliver(ctx, proj, job, result, errMsg)
+	} else {
+		w.deliverWebhook(ctx, proj, job, result, errMsg)
+	}
+}
+ 
+// settleAndDeliver handles post-job processing for cloud-managed projects.
+//
+// Current responsibilities:
+//   - Record usage in usage_daily_rollup (for stats endpoint)
+//   - Relay webhook to merchant's configured URL
+//
+// Future responsibilities (when platform-managed relayer is built):
+//   - Gas cost settlement
+//   - Refund credits if job failed before broadcast
+//
+// Designed so each step is independent — a failure in one does not prevent
+// the others from running.
+func (w *Worker) settleAndDeliver(
+	ctx context.Context,
+	proj *storage.Project,
+	job *storage.SigningJob,
+	result *signingResult,
+	errMsg string,
+) {
+	// ── Step 1: Record usage ──────────────────────────────────────────────
+	// Only record for completed jobs — failed/dead jobs were already debited
+	// at request time (the debit is the cost of attempting the operation).
+	// We record usage here (not just in the handler) to catch async jobs
+	// that were enqueued and completed later.
+	//
+	// For synchronous operations (create_wallet), the SDK handler already
+	// called RecordUsage. For async signing/sweep jobs, this is the first
+	// time we know the operation completed.
+	if errMsg == "" && proj.OrgID != nil {
+		// Determine operation cost for rollup.
+		oc, err := w.creditsMgr.GetCost(ctx, job.Operation)
+		if err == nil && oc != nil {
+			if err := w.creditsMgr.RecordUsage(ctx, *proj.OrgID, job.Operation, oc.Cost); err != nil {
+				log.Printf("worker: record usage failed for job %s: %v", job.ID, err)
+				// Non-fatal — stats are best-effort. Don't block webhook delivery.
+			}
+		}
+	}
+ 
+	// ── Step 2: Relay webhook to merchant ─────────────────────────────────
+	// Same logic as direct delivery. Cloud-managed projects can still
+	// configure a webhook URL and receive events.
+	w.deliverWebhook(ctx, proj, job, result, errMsg)
 }
 
 func (w *Worker) deliverWebhook(ctx context.Context, proj *storage.Project, job *storage.SigningJob, result *signingResult, errMsg string) {

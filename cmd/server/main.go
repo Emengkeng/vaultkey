@@ -10,12 +10,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/clerk/clerk-sdk-go/v2"
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"github.com/vaultkey/vaultkey/config"
 	"github.com/vaultkey/vaultkey/internal/api/handlers"
 	"github.com/vaultkey/vaultkey/internal/api/middleware"
+	"github.com/vaultkey/vaultkey/internal/credits"
+	"github.com/vaultkey/vaultkey/internal/cron"
 	internalkms "github.com/vaultkey/vaultkey/internal/kms"
 	"github.com/vaultkey/vaultkey/internal/nonce"
 	"github.com/vaultkey/vaultkey/internal/queue"
@@ -91,13 +93,27 @@ func main() {
 	webhookSvc := webhook.New()
 	relayerSvc := relayer.New(store, walletSvc, rpcMgr, nonceMgr)
 	sweepSvc := sweep.New(store, walletSvc, rpcMgr, q)
+	creditsMgr := credits.New(store.DB())
 
 	registry := stablecoin.NewRegistry(store, redisClient)
 	stablecoinSvc := stablecoin.NewService(store, rpcMgr, q, registry)
 
+		// ── Cron (free tier grant) ────────────────────────────────────────────────
+	cronRunner := cron.New(creditsMgr, cfg.Cloud.FreeTier.MonthlyCredits)
+	go cronRunner.Start(ctx)
+
+	// Run immediately on startup to catch any missed grants (e.g. after downtime).
+	// Uses a short-lived context so it doesn't block startup.
+	go func() {
+		startupCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		cronRunner.RunFreeTierGrantNow(startupCtx)
+	}()
+
 	// ── Worker Pool ───────────────────────────────────────────────────────────
 	w := worker.New(
 		store, q, walletSvc, relayerSvc, webhookSvc, nonceMgr, rpcMgr,
+		creditsMgr,
 		cfg.Worker.Concurrency,
 		cfg.Worker.PollTimeoutSec,
 	)
@@ -112,6 +128,11 @@ func main() {
 	sweepH := handlers.NewSweepHandler(store, sweepSvc)
 	stablecoinH := handlers.NewStablecoinHandler(stablecoinSvc)
 	adminH := handlers.NewAdminHandler(registry)
+	sdkH := handlers.NewSDKHandler(
+		creditsMgr, store, walletSvc, q, rpcMgr, sweepSvc, stablecoinSvc,
+	)
+	paymentH := handlers.NewPaymentHandler(store, creditsMgr, cfg)
+	usageH := handlers.NewUsageHandler(creditsMgr)
 
 	authed := middleware.Auth(store, limiter, redisClient)
 	admin := middleware.AdminAuth(cfg.AdminToken)
@@ -159,7 +180,11 @@ func main() {
 
 	// ── Cloud routes (Clerk JWT auth) — only registered when cloud is enabled ──
 	if cfg.Cloud.EnableCloudFeatures {
-		registerCloudRoutes(mux, store, cfg, redisClient)
+		registerCloudRoutes(mux, store, cfg, redisClient, paymentH, usageH)
+		registerSDKRoutes(mux, store, cfg, redisClient, sdkH, limiter)
+
+		// ── Stripe Webhooks (public — verified via Stripe signature) ───────────
+		mux.Handle("POST /webhooks/stripe", http.HandlerFunc(paymentH.StripeWebhook))
 	}
 
 	// ── HTTP Server ───────────────────────────────────────────────────────────
@@ -196,7 +221,14 @@ func main() {
 
 // registerCloudRoutes wires all /cloud/* and /webhooks/* routes.
 // Only called when ENABLE_CLOUD_FEATURES=true.
-func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.Config, redisClient *redis.Client) {
+func registerCloudRoutes(
+	mux *http.ServeMux, 
+	store *storage.Store, 
+	cfg *config.Config, 
+	redisClient *redis.Client,
+	paymentH *handlers.PaymentHandler,
+	usageH *handlers.UsageHandler,
+	) {
 	cloudH := handlers.NewCloudHandler(store, redisClient, cfg)
 
 	// Clerk JWT middleware (applied individually or composed per route).
@@ -250,6 +282,8 @@ func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.C
 	mux.Handle("GET /cloud/organizations/{org_id}/api-keys", orgDeveloper(cloudH.ListAPIKeys))
 	mux.Handle("DELETE /cloud/organizations/{org_id}/api-keys/{key_id}", orgAdmin(cloudH.RevokeAPIKey))
 
+	registerBillingRoutes(mux, store, cfg, paymentH, usageH, clerkAuth, orgViewer, orgDeveloper)
+
 	// ── Clerk Webhooks (public — verified via Svix signature) ───────────
 	webhookH, err := handlers.NewWebhookHandler(store, cfg.Cloud.ClerkWebhookSecret)
 	if err != nil {
@@ -258,6 +292,71 @@ func registerCloudRoutes(mux *http.ServeMux, store *storage.Store, cfg *config.C
 	mux.Handle("POST /webhooks/clerk", webhookH)
 
 	log.Println("cloud routes: registered")
+}
+
+// ── registerSDKRoutes ─────────────────────────────────────────────────────────
+// Registers routes under /sdk/*, protected by SDK auth (project API keys or Clerk JWTs).
+func registerSDKRoutes(
+	mux *http.ServeMux,
+	store *storage.Store,
+	cfg *config.Config,
+	redisClient *redis.Client,
+	sdkH *handlers.SDKHandler,
+	limiter *ratelimit.Limiter,
+) {
+	sdkAuth := middleware.SDKAuth(store, limiter, redisClient)
+ 
+	sdkAuthed := func(fn http.HandlerFunc) http.Handler {
+		return sdkAuth(http.HandlerFunc(fn))
+	}
+ 
+	// ── Wallet operations ─────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets",                   sdkAuthed(sdkH.CreateWallet))
+	mux.Handle("GET /sdk/wallets/{walletId}",         sdkAuthed(sdkH.GetWallet))
+	mux.Handle("GET /sdk/users/{userId}/wallets",     sdkAuthed(sdkH.ListUserWallets))
+ 
+	// ── Signing operations ────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/evm",    sdkAuthed(sdkH.SignEVMTransaction))
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/evm",        sdkAuthed(sdkH.SignEVMMessage))
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/solana", sdkAuthed(sdkH.SignSolanaTransaction))
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/solana",     sdkAuthed(sdkH.SignSolanaMessage))
+ 
+	// ── Free operations ───────────────────────────────────────────────────
+	mux.Handle("GET /sdk/jobs/{jobId}",                         sdkAuthed(sdkH.GetJob))
+	mux.Handle("GET /sdk/wallets/{walletId}/balance",           sdkAuthed(sdkH.GetBalance))
+	mux.Handle("POST /sdk/wallets/{walletId}/broadcast",        sdkAuthed(sdkH.Broadcast))
+ 
+	// ── Sweep ─────────────────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets/{walletId}/sweep",            sdkAuthed(sdkH.TriggerSweep))
+ 
+	// ── Stablecoin ────────────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets/{walletId}/stablecoin/transfer/{chainType}", sdkAuthed(sdkH.StablecoinTransfer))
+	mux.Handle("GET /sdk/wallets/{walletId}/stablecoin/balance/{chainType}",   sdkAuthed(sdkH.StablecoinBalance))
+ 
+	log.Println("sdk routes: registered")
+}
+
+// ── registerBillingRoutes ─────────────────────────────────────────────────────
+// Registers billing-related routes under /billing/*, protected by API key auth.
+func registerBillingRoutes(
+	mux *http.ServeMux,
+	store *storage.Store,
+	cfg *config.Config,
+	paymentH *handlers.PaymentHandler,
+	usageH *handlers.UsageHandler,
+	clerkAuth func(http.Handler) http.Handler,
+	orgViewer func(http.HandlerFunc) http.Handler,
+	orgDeveloper func(http.HandlerFunc) http.Handler,
+) {
+	// Purchase — any org member can initiate
+	mux.Handle("POST /cloud/billing/purchase",  orgViewer(paymentH.CreatePaymentIntent))
+ 
+	// Billing history — viewer and above
+	mux.Handle("GET /cloud/billing/history",    orgViewer(paymentH.GetBillingHistory))
+ 
+	// Usage stats — developer and above
+	mux.Handle("GET /cloud/organizations/{org_id}/usage",    orgDeveloper(usageH.GetUsage))
+	mux.Handle("GET /cloud/organizations/{org_id}/credits",  orgViewer(usageH.GetCreditBalance))
 }
 
 func buildKMS(ctx context.Context, cfg *config.Config) (internalkms.KMS, error) {

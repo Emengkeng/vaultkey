@@ -7,6 +7,16 @@ import (
 	"strings"
 )
 
+type StripeConfig struct {
+	SecretKey     string // STRIPE_SECRET_KEY (sk_live_xxx or sk_test_xxx)
+	WebhookSecret string // STRIPE_WEBHOOK_SECRET (whsec_xxx)
+	PublishableKey string // STRIPE_PUBLISHABLE_KEY (pk_live_xxx) — returned to frontend
+}
+
+type FreeTierConfig struct {
+	MonthlyCredits int64 // FREE_TIER_MONTHLY_CREDITS, default 1000 (testnet: 500)
+}
+
 type Config struct {
 	Environment string // "testnet" | "mainnet"
 	Port        string
@@ -77,6 +87,9 @@ type CloudConfig struct {
 	ClerkPublishableKey string
 	ClerkWebhookSecret  string
 
+	Stripe      StripeConfig
+	FreeTier   FreeTierConfig
+
 	// Testnet-specific limits (only used when Environment="testnet")
     MaxProjectsPerOrg  int // e.g., 2
     MaxMembersPerOrg   int // e.g., 3
@@ -110,6 +123,10 @@ func Load() (*Config, error) {
 		clerkPublishable := os.Getenv("CLERK_PUBLISHABLE_KEY")
 		clerkWebhook := os.Getenv("CLERK_WEBHOOK_SECRET")
 
+		stripeSecret := os.Getenv("STRIPE_SECRET_KEY")
+		stripeWebhook := os.Getenv("STRIPE_WEBHOOK_SECRET")
+		stripePublishable := os.Getenv("STRIPE_PUBLISHABLE_KEY")
+
 		if clerkSecret == "" {
 			return nil, fmt.Errorf("CLERK_SECRET_KEY is required when ENABLE_CLOUD_FEATURES=true")
 		}
@@ -120,9 +137,31 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("CLERK_WEBHOOK_SECRET is required when ENABLE_CLOUD_FEATURES=true")
 		}
 
+		if stripeSecret == "" {
+			return nil, fmt.Errorf("STRIPE_SECRET_KEY is required when ENABLE_CLOUD_FEATURES=true")
+		}
+		if stripeWebhook == "" {
+			return nil, fmt.Errorf("STRIPE_WEBHOOK_SECRET is required when ENABLE_CLOUD_FEATURES=true")
+		}
+
 		cloudCfg.ClerkSecretKey = clerkSecret
 		cloudCfg.ClerkPublishableKey = clerkPublishable
 		cloudCfg.ClerkWebhookSecret = clerkWebhook
+
+		cloudCfg.Stripe = StripeConfig{
+			SecretKey:      stripeSecret,
+			WebhookSecret:  stripeWebhook,
+			PublishableKey: stripePublishable,
+		}
+
+		// Free tier grant amount (lower on testnet):
+		defaultGrant := int64(1000)
+		if env == "testnet" {
+			defaultGrant = 500
+		}
+		cloudCfg.FreeTier = FreeTierConfig{
+			MonthlyCredits: int64(getEnvInt("FREE_TIER_MONTHLY_CREDITS", int(defaultGrant))),
+		}
 	}
 
 	cfg := &Config{

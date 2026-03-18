@@ -66,34 +66,74 @@ type Organization struct {
 	Slug         string
 	CreatedBy    string
 	BillingEmail string
+	HasEverPurchased    bool
+	CreditsExpireMonths int
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	DeletedAt    *time.Time
 }
 
+// CreateOrganization creates a new org and seeds its credit balance row
+// in a single transaction. The balance row must exist before any debit
+// can run — doing it here guarantees it is never missing.
 func (s *Store) CreateOrganization(ctx context.Context, name, slug, createdBy, billingEmail string) (*Organization, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin create org transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+ 
 	org := &Organization{}
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`INSERT INTO organizations (name, slug, created_by, billing_email)
 		 VALUES ($1, $2, $3, $4)
-		 RETURNING id, name, slug, created_by, billing_email, created_at, updated_at, deleted_at`,
+		 RETURNING id, name, slug, created_by, billing_email,
+		           has_ever_purchased, credits_expire_months,
+		           created_at, updated_at, deleted_at`,
 		name, slug, createdBy, billingEmail,
-	).Scan(&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
-		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt)
+	).Scan(
+		&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
+		&org.HasEverPurchased, &org.CreditsExpireMonths,
+		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create organization: %w", err)
 	}
+ 
+	// Seed credit balance row — required before any debit can run.
+	// ON CONFLICT DO NOTHING: safe if somehow the row already exists.
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO org_credit_balance (org_id, balance)
+		 VALUES ($1, 0)
+		 ON CONFLICT (org_id) DO NOTHING`,
+		org.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("seed credit balance: %w", err)
+	}
+ 
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit create org: %w", err)
+	}
+ 
 	return org, nil
 }
 
+// GetOrganizationByID returns an active org by its primary key.
 func (s *Store) GetOrganizationByID(ctx context.Context, orgID string) (*Organization, error) {
 	org := &Organization{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, slug, created_by, billing_email, created_at, updated_at, deleted_at
-		 FROM organizations WHERE id = $1 AND deleted_at IS NULL`,
+		`SELECT id, name, slug, created_by, billing_email,
+		        has_ever_purchased, credits_expire_months,
+		        created_at, updated_at, deleted_at
+		 FROM organizations
+		 WHERE id = $1 AND deleted_at IS NULL`,
 		orgID,
-	).Scan(&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
-		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt)
+	).Scan(
+		&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
+		&org.HasEverPurchased, &org.CreditsExpireMonths,
+		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -103,14 +143,21 @@ func (s *Store) GetOrganizationByID(ctx context.Context, orgID string) (*Organiz
 	return org, nil
 }
 
+// GetOrganizationBySlug returns an active org by its slug.
 func (s *Store) GetOrganizationBySlug(ctx context.Context, slug string) (*Organization, error) {
 	org := &Organization{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, slug, created_by, billing_email, created_at, updated_at, deleted_at
-		 FROM organizations WHERE slug = $1 AND deleted_at IS NULL`,
+		`SELECT id, name, slug, created_by, billing_email,
+		        has_ever_purchased, credits_expire_months,
+		        created_at, updated_at, deleted_at
+		 FROM organizations
+		 WHERE slug = $1 AND deleted_at IS NULL`,
 		slug,
-	).Scan(&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
-		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt)
+	).Scan(
+		&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
+		&org.HasEverPurchased, &org.CreditsExpireMonths,
+		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -123,7 +170,9 @@ func (s *Store) GetOrganizationBySlug(ctx context.Context, slug string) (*Organi
 // GetOrganizationsForUser returns all active orgs where the user is an active member.
 func (s *Store) GetOrganizationsForUser(ctx context.Context, clerkUserID string) ([]*Organization, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT o.id, o.name, o.slug, o.created_by, o.billing_email, o.created_at, o.updated_at, o.deleted_at
+		`SELECT o.id, o.name, o.slug, o.created_by, o.billing_email,
+		        o.has_ever_purchased, o.credits_expire_months,
+		        o.created_at, o.updated_at, o.deleted_at
 		 FROM organizations o
 		 JOIN org_members m ON m.org_id = o.id
 		 WHERE m.clerk_user_id = $1
@@ -136,11 +185,15 @@ func (s *Store) GetOrganizationsForUser(ctx context.Context, clerkUserID string)
 		return nil, fmt.Errorf("list orgs for user: %w", err)
 	}
 	defer rows.Close()
+ 
 	var orgs []*Organization
 	for rows.Next() {
 		o := &Organization{}
-		if err := rows.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.BillingEmail,
-			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+		if err := rows.Scan(
+			&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.BillingEmail,
+			&o.HasEverPurchased, &o.CreditsExpireMonths,
+			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
+		); err != nil {
 			return nil, err
 		}
 		orgs = append(orgs, o)
@@ -148,16 +201,22 @@ func (s *Store) GetOrganizationsForUser(ctx context.Context, clerkUserID string)
 	return orgs, rows.Err()
 }
 
+// UpdateOrganization updates name and billing email.
 func (s *Store) UpdateOrganization(ctx context.Context, orgID, name, billingEmail string) (*Organization, error) {
 	org := &Organization{}
 	err := s.db.QueryRowContext(ctx,
 		`UPDATE organizations
 		 SET name = $1, billing_email = $2, updated_at = now()
 		 WHERE id = $3 AND deleted_at IS NULL
-		 RETURNING id, name, slug, created_by, billing_email, created_at, updated_at, deleted_at`,
+		 RETURNING id, name, slug, created_by, billing_email,
+		           has_ever_purchased, credits_expire_months,
+		           created_at, updated_at, deleted_at`,
 		name, billingEmail, orgID,
-	).Scan(&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
-		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt)
+	).Scan(
+		&org.ID, &org.Name, &org.Slug, &org.CreatedBy, &org.BillingEmail,
+		&org.HasEverPurchased, &org.CreditsExpireMonths,
+		&org.CreatedAt, &org.UpdatedAt, &org.DeletedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -167,9 +226,11 @@ func (s *Store) UpdateOrganization(ctx context.Context, orgID, name, billingEmai
 	return org, nil
 }
 
+// SoftDeleteOrganization soft-deletes an org by setting deleted_at.
 func (s *Store) SoftDeleteOrganization(ctx context.Context, orgID string) error {
 	result, err := s.db.ExecContext(ctx,
-		`UPDATE organizations SET deleted_at = now(), updated_at = now()
+		`UPDATE organizations
+		 SET deleted_at = now(), updated_at = now()
 		 WHERE id = $1 AND deleted_at IS NULL`,
 		orgID,
 	)
@@ -183,16 +244,22 @@ func (s *Store) SoftDeleteOrganization(ctx context.Context, orgID string) error 
 	return nil
 }
 
-// GetOrganizationProject returns the project linked to an org (nil if not yet created).
+// GetOrganizationProject returns the project linked to an org.
+// Returns nil if not yet created.
 func (s *Store) GetOrganizationProject(ctx context.Context, orgID string) (*Project, error) {
 	p := &Project{}
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, name, api_key, api_secret_hash, webhook_url, webhook_secret,
-		        rate_limit_rps, max_retries, created_at
-		 FROM projects WHERE org_id = $1 AND deleted_at IS NULL`,
+		        rate_limit_rps, max_retries, cloud_managed, org_id, created_at
+		 FROM projects
+		 WHERE org_id = $1 AND deleted_at IS NULL`,
 		orgID,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.APISecretHash, &p.WebhookURL, &p.WebhookSecret,
-		&p.RateLimitRPS, &p.MaxRetries, &p.CreatedAt)
+	).Scan(
+		&p.ID, &p.Name, &p.APIKey, &p.APISecretHash,
+		&p.WebhookURL, &p.WebhookSecret,
+		&p.RateLimitRPS, &p.MaxRetries,
+		&p.CloudManaged, &p.OrgID, &p.CreatedAt,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -555,9 +622,16 @@ func (s *Store) RevokeAPIKey(ctx context.Context, projectID, keyID string) (stri
 	return rawKey, nil
 }
 
-// EnsureProjectForOrg creates a project for an org if none exists.
+// EnsureProjectForOrg creates a cloud-managed project for an org if none exists.
 // Idempotent: returns existing project if already created.
+//
+// Key differences from CreateProject (self-hosted):
+//   - cloud_managed = true  → worker uses settleAndDeliver path
+//   - org_id = orgID        → SDKAuth can resolve org for credit deduction
+//   - rate_limit_rps = 10   → free tier default; raised to 1000 on first purchase
+//   - api_key = ''          → cloud projects use api_keys table, not this column
 func (s *Store) EnsureProjectForOrg(ctx context.Context, orgID, orgName string) (*Project, error) {
+	// Check if already exists.
 	existing, err := s.GetOrganizationProject(ctx, orgID)
 	if err != nil {
 		return nil, err
@@ -565,19 +639,31 @@ func (s *Store) EnsureProjectForOrg(ctx context.Context, orgID, orgName string) 
 	if existing != nil {
 		return existing, nil
 	}
-
+ 
 	p := &Project{}
 	err = s.db.QueryRowContext(ctx,
-		`INSERT INTO projects (name, api_key, api_secret_hash, org_id, rate_limit_rps, max_retries)
-		 VALUES ($1, '', '', $2, 100, 3)
-		 ON CONFLICT (org_id) WHERE deleted_at IS NULL AND org_id IS NOT NULL DO NOTHING
-		 RETURNING id, name, api_key, api_secret_hash, webhook_url, webhook_secret, rate_limit_rps, max_retries, created_at`,
+		`INSERT INTO projects
+		    (name, api_key, api_secret_hash, org_id, cloud_managed,
+		     rate_limit_rps, max_retries)
+		 VALUES ($1, '', '', $2, true, 10, 3)
+		 ON CONFLICT (org_id)
+		 WHERE deleted_at IS NULL AND org_id IS NOT NULL
+		 DO NOTHING
+		 RETURNING id, name, api_key, api_secret_hash, webhook_url, webhook_secret,
+		           rate_limit_rps, max_retries, cloud_managed, org_id, created_at`,
 		orgName+" Project", orgID,
-	).Scan(&p.ID, &p.Name, &p.APIKey, &p.APISecretHash, &p.WebhookURL, &p.WebhookSecret,
-		&p.RateLimitRPS, &p.MaxRetries, &p.CreatedAt)
-	if err != nil {
-		// Retry fetch — race with another request.
+	).Scan(
+		&p.ID, &p.Name, &p.APIKey, &p.APISecretHash,
+		&p.WebhookURL, &p.WebhookSecret,
+		&p.RateLimitRPS, &p.MaxRetries,
+		&p.CloudManaged, &p.OrgID, &p.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		// Lost the race to another concurrent request — fetch the winner's row.
 		return s.GetOrganizationProject(ctx, orgID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ensure project for org: %w", err)
 	}
 	return p, nil
 }

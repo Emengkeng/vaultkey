@@ -108,6 +108,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/streamingfast/logging v0.0.0-20230608130331-f22c91403091 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/stripe/stripe-go/v76 v76.25.0 // indirect
 	github.com/supranational/blst v0.3.16 // indirect
 	github.com/svix/svix-webhooks v1.88.0 // indirect
 	github.com/testcontainers/testcontainers-go v0.41.0 // indirect
