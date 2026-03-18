@@ -48,7 +48,7 @@ func NewSDKHandler(
 ) *SDKHandler {
 	return &SDKHandler{
 		credits:     creditsMgr,
-		handler:     New(store, walletSvc, q, rpcMgr),
+		handler:     New(store, walletSvc, q, rpcMgr, cfg),
 		sweepH:      NewSweepHandler(store, sweepSvc),
 		stablecoinH: NewStablecoinHandler(stablecoinSvc),
 		store:       store,
