@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 
+	"github.com/vaultkey/vaultkey/config"
 	"github.com/vaultkey/vaultkey/internal/api/middleware"
 	"github.com/vaultkey/vaultkey/internal/credits"
 	"github.com/vaultkey/vaultkey/internal/queue"
@@ -22,6 +25,7 @@ import (
 // The underlying Handler, RelayerHandler, SweepHandler, StablecoinHandler
 // are reused unchanged — SDKHandler composes them rather than duplicating.
 type SDKHandler struct {
+	cfg         *config.Config
 	credits     *credits.Manager
 	handler     *Handler
 	sweepH      *SweepHandler
@@ -33,6 +37,7 @@ type SDKHandler struct {
 }
 
 func NewSDKHandler(
+	cfg         *config.Config,
 	creditsMgr *credits.Manager,
 	store *storage.Store,
 	walletSvc *wallet.Service,
@@ -120,33 +125,74 @@ func (h *SDKHandler) debit(w http.ResponseWriter, r *http.Request, operation str
 func (h *SDKHandler) CreateWallet(w http.ResponseWriter, r *http.Request) {
 	project := middleware.ProjectFromContext(r.Context())
 	orgID := middleware.OrgIDFromContext(r.Context())
-
-	// Free tier wallet cap: 50 wallets per org.
-	// Check has_ever_purchased — if false, enforce the cap.
+ 
 	org, err := h.store.GetOrganizationByID(r.Context(), orgID)
 	if err != nil || org == nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-
-	if !org.HasEverPurchased {
-		count, err := h.store.CountWalletsForOrg(r.Context(), project.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		if count >= 50 {
-			writeError(w, http.StatusForbidden,
-				"free tier wallet limit reached (50 wallets) — purchase credits to unlock unlimited wallets")
-			return
-		}
+ 
+	// Resolve all limits in one DB round-trip.
+	limits, err := h.credits.ResolveWalletLimits(r.Context(), orgID, project.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
 	}
-
+ 
+	// ── Free tier hard cap ────────────────────────────────────────────────────
+	if !org.HasEverPurchased && limits.ExistingCount >= 50 {
+		writeError(w, http.StatusForbidden,
+			"free tier wallet limit reached (50 wallets) — purchase credits to unlock unlimited wallets")
+		return
+	}
+ 
+	// ── Pro hard cap (absolute ceiling, abuse prevention) ────────────────────
+	// Contact support to raise — intended for legitimate enterprise use,
+	// not something a bad actor can bypass with money alone.
+	if org.HasEverPurchased && limits.ExistingCount >= limits.HardCap {
+		writeError(w, http.StatusForbidden, fmt.Sprintf(
+			"organization wallet limit reached (%d wallets) — contact (%s) to raise this limit",
+			limits.HardCap,
+			h.cfg.SupportEmail,
+		))
+		return
+	}
+ 
+	// ── Hourly rate limit (dynamic, scales with org size) ────────────────────
+	// Checked for all orgs (free and pro) to prevent burst abuse.
+	// Limit grows with the org's existing wallet count so legitimate
+	// platforms experiencing viral growth are not blocked.
+	if limits.HourlyUsed >= limits.HourlyLimit {
+		w.Header().Set("Retry-After", "3600")
+		writeError(w, http.StatusTooManyRequests, fmt.Sprintf(
+			"wallet creation rate limit exceeded (%d/hour) — "+
+				"this limit scales automatically as your platform grows, "+
+				"or contact (%s) for an immediate increase",
+			limits.HourlyLimit,
+			h.cfg.SupportEmail,
+		))
+		return
+	}
+ 
+	// ── Velocity alert (non-blocking, ops visibility) ─────────────────────────
+	// Log when an org creates more than 500 wallets in an hour.
+	// This catches abuse early without blocking legitimate traffic.
+	// Threshold is 10x the base limit — well above normal but below
+	// the point where it would cause infrastructure problems.
+	if limits.HourlyUsed > 500 {
+		log.Printf(
+			"WALLET_VELOCITY_ALERT: org=%s created %d wallets in last hour "+
+				"(limit=%d, total=%d) — verify this is legitimate traffic",
+			orgID, limits.HourlyUsed, limits.HourlyLimit, limits.ExistingCount,
+		)
+	}
+ 
+	// ── Credit deduction ──────────────────────────────────────────────────────
 	if !h.debit(w, r, "create_wallet") {
 		return
 	}
-
-	// Forward to existing handler — identical logic, no duplication.
+ 
+	// ── Forward to existing handler ───────────────────────────────────────────
 	h.handler.CreateWallet(w, r)
 }
 

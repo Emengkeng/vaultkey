@@ -22,6 +22,7 @@ type Config struct {
 	Port        string
 	DatabaseURL string
 	AdminToken  string
+	SupportEmail string // for user-facing error messages with contact info, e.g. "support@vaultkey.io"
 	KMS         KMSConfig
 	Vault       VaultConfig
 	GCP         GCPConfig
@@ -168,6 +169,7 @@ func Load() (*Config, error) {
 		Port:        getEnv("PORT", "8080"),
 		DatabaseURL: requireEnv("DATABASE_URL"),
 		AdminToken:  adminToken,
+		SupportEmail: getEnv("PLARTFORM_SUPPORT_EMAIL", "support@vaultkeyio.com"),
 		KMS: KMSConfig{
 			Provider: provider,
 		},

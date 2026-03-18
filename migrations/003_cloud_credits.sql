@@ -92,6 +92,10 @@ INSERT INTO operation_costs (operation, cost, description) VALUES
     ('gas_evm_optimism',             3,  'Gas cost for Optimism (chain 10) — reserved'),
     ('gas_solana',                   1,  'Gas cost for Solana — reserved')
 
+    ('create_wallet_hard_cap',        200000, 'Default max wallets per org (pro)'),
+    ('create_wallet_hourly_base',     50,     'Base hourly wallet creation limit for new orgs'),
+    ('create_wallet_hourly_per_1k',   100,    'Additional hourly allowance per 1000 existing wallets')
+
 ON CONFLICT (operation) DO NOTHING;
 
 
@@ -278,3 +282,14 @@ ON CONFLICT (org_id) DO NOTHING;
 CREATE INDEX IF NOT EXISTS idx_orgs_has_ever_purchased
     ON organizations(has_ever_purchased)
     WHERE has_ever_purchased = false AND deleted_at IS NULL;
+
+
+-- Per-org limit overrides. Rows only exist when an org needs non-default limits.
+-- If no row exists, the system falls back to operation_costs defaults.
+CREATE TABLE IF NOT EXISTS org_limits (
+    org_id              UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+    max_wallets         BIGINT,    -- NULL = use operation_costs default
+    max_wallets_per_hour BIGINT,   -- NULL = use dynamic scaling
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by          TEXT        -- clerk_user_id of admin who set this
+);

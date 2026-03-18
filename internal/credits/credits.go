@@ -49,6 +49,24 @@ type CreditBalance struct {
 	UpdatedAt time.Time
 }
 
+// WalletLimits holds the resolved limits for an org's wallet creation.
+// All values are fully resolved — callers never need to fall back themselves.
+type WalletLimits struct {
+	// HardCap is the absolute maximum wallets this org can have.
+	HardCap int64
+ 
+	// HourlyLimit is the maximum wallets this org can create in any 60-minute window.
+	// Derived dynamically from existing wallet count unless overridden in org_limits.
+	HourlyLimit int64
+ 
+	// ExistingCount is the current wallet count — included so callers
+	// don't need a second query.
+	ExistingCount int64
+ 
+	// HourlyUsed is how many wallets the org has created in the last hour.
+	HourlyUsed int64
+}
+
 // Manager handles all credit operations. All mutating operations run inside
 // explicit Postgres transactions with SELECT ... FOR UPDATE to serialize
 // concurrent debits for the same org. This prevents overdrafts under load.
@@ -500,4 +518,127 @@ func (m *Manager) GetDailyUsage(ctx context.Context, orgID, startDate, endDate s
 		rows2 = append(rows2, d)
 	}
 	return rows2, rows.Err()
+}
+
+
+
+// ResolveWalletLimits returns the fully resolved wallet creation limits for an org.
+//
+// Resolution order for hard cap:
+//  1. org_limits.max_wallets (per-org override, set by support for enterprise)
+//  2. operation_costs['create_wallet_hard_cap'] (global default)
+//  3. Hardcoded fallback: 200,000
+//
+// Resolution order for hourly limit:
+//  1. org_limits.max_wallets_per_hour (per-org override)
+//  2. Dynamic formula: hourly_base + (existing_wallets / 1000) * hourly_per_1k
+//     where hourly_base and hourly_per_1k come from operation_costs
+//  3. Hardcoded fallback: 50/hour base, 100 per 1k
+//
+// This means:
+//   - A new org (0 wallets) gets 50/hour by default
+//   - An org with 10,000 wallets gets 1,050/hour
+//   - An enterprise org with a custom override gets whatever support set
+//   - All values are tunable via operation_costs without a deploy
+func (m *Manager) ResolveWalletLimits(ctx context.Context, orgID, projectID string) (*WalletLimits, error) {
+	// ── Step 1: Fetch all inputs in parallel via a single query ──────────────
+	// One round-trip: get org_limits override, existing wallet count,
+	// hourly wallet creation count, and all three cost config values.
+	// Using COALESCE so missing rows return safe defaults.
+ 
+	var (
+		overrideHardCap     sql.NullInt64
+		overrideHourlyLimit sql.NullInt64
+		existingCount       int64
+		hourlyUsed          int64
+		configHardCap       int64
+		configHourlyBase    int64
+		configHourlyPer1k   int64
+	)
+ 
+	err := m.db.QueryRowContext(ctx, `
+		SELECT
+		    -- Per-org overrides (NULL if no override row exists)
+		    ol.max_wallets,
+		    ol.max_wallets_per_hour,
+ 
+		    -- Current wallet count for this project
+		    -- Excludes internal wallets (master, relayer) via user_id filter
+		    (SELECT COUNT(*) FROM wallets
+		     WHERE project_id = $2
+		       AND user_id NOT LIKE '\_%%' ESCAPE '\'),
+ 
+		    -- Wallets created in the last hour (from credit_ledger)
+		    (SELECT COUNT(*) FROM credit_ledger
+		     WHERE org_id = $1
+		       AND reason = 'operation'
+		       AND metadata->>'operation' = 'create_wallet'
+		       AND created_at >= now() - INTERVAL '1 hour'),
+ 
+		    -- Global config defaults
+		    COALESCE(
+		        (SELECT cost FROM operation_costs
+		         WHERE operation = 'create_wallet_hard_cap' AND active = true),
+		        200000
+		    ),
+		    COALESCE(
+		        (SELECT cost FROM operation_costs
+		         WHERE operation = 'create_wallet_hourly_base' AND active = true),
+		        50
+		    ),
+		    COALESCE(
+		        (SELECT cost FROM operation_costs
+		         WHERE operation = 'create_wallet_hourly_per_1k' AND active = true),
+		        100
+		    )
+ 
+		FROM organizations o
+		LEFT JOIN org_limits ol ON ol.org_id = o.id
+		WHERE o.id = $1
+	`, orgID, projectID).Scan(
+		&overrideHardCap,
+		&overrideHourlyLimit,
+		&existingCount,
+		&hourlyUsed,
+		&configHardCap,
+		&configHourlyBase,
+		&configHourlyPer1k,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve wallet limits: %w", err)
+	}
+ 
+	// ── Step 2: Resolve hard cap ──────────────────────────────────────────────
+	hardCap := configHardCap
+	if overrideHardCap.Valid {
+		hardCap = overrideHardCap.Int64
+	}
+ 
+	// ── Step 3: Resolve hourly limit ──────────────────────────────────────────
+	var hourlyLimit int64
+	if overrideHourlyLimit.Valid {
+		// Enterprise override — use exactly what support set.
+		hourlyLimit = overrideHourlyLimit.Int64
+	} else {
+		// Dynamic formula: scales with org's existing wallet footprint.
+		// New org (0 wallets): base only.
+		// Established org: base + (existing / 1000) * per_1k.
+		//
+		// Example with defaults (base=50, per_1k=100):
+		//   0 wallets    →    50/hour
+		//   500 wallets  →    50/hour  (below 1k threshold)
+		//   1,000        →   150/hour
+		//   5,000        →   550/hour
+		//   10,000       → 1,050/hour
+		//   50,000       → 5,050/hour
+		//   100,000      → 10,050/hour
+		hourlyLimit = configHourlyBase + (existingCount/1000)*configHourlyPer1k
+	}
+ 
+	return &WalletLimits{
+		HardCap:       hardCap,
+		HourlyLimit:   hourlyLimit,
+		ExistingCount: existingCount,
+		HourlyUsed:    hourlyUsed,
+	}, nil
 }

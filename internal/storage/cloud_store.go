@@ -668,6 +668,65 @@ func (s *Store) EnsureProjectForOrg(ctx context.Context, orgID, orgName string) 
 	return p, nil
 }
 
+
+// OrgLimits holds per-org wallet limit overrides.
+// Fields are pointers — nil means "use system default".
+type OrgLimits struct {
+	OrgID              string
+	MaxWallets         *int64
+	MaxWalletsPerHour  *int64
+	UpdatedAt          time.Time
+	UpdatedBy          *string // clerk_user_id of support admin
+}
+ 
+// GetOrgLimits returns the limit overrides for an org.
+// Returns nil if no overrides have been set (org uses system defaults).
+func (s *Store) GetOrgLimits(ctx context.Context, orgID string) (*OrgLimits, error) {
+	l := &OrgLimits{}
+	err := s.db.QueryRowContext(ctx,
+		`SELECT org_id, max_wallets, max_wallets_per_hour, updated_at, updated_by
+		 FROM org_limits
+		 WHERE org_id = $1`,
+		orgID,
+	).Scan(&l.OrgID, &l.MaxWallets, &l.MaxWalletsPerHour, &l.UpdatedAt, &l.UpdatedBy)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get org limits: %w", err)
+	}
+	return l, nil
+}
+ 
+// SetOrgLimits upserts limit overrides for an org.
+// Pass nil for a field to clear its override (revert to system default).
+// Called by internal support tooling — not exposed via public API.
+func (s *Store) SetOrgLimits(ctx context.Context, orgID string, maxWallets, maxWalletsPerHour *int64, updatedBy string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO org_limits (org_id, max_wallets, max_wallets_per_hour, updated_by, updated_at)
+		 VALUES ($1, $2, $3, $4, now())
+		 ON CONFLICT (org_id) DO UPDATE
+		   SET max_wallets          = EXCLUDED.max_wallets,
+		       max_wallets_per_hour = EXCLUDED.max_wallets_per_hour,
+		       updated_by           = EXCLUDED.updated_by,
+		       updated_at           = now()`,
+		orgID, maxWallets, maxWalletsPerHour, updatedBy,
+	)
+	if err != nil {
+		return fmt.Errorf("set org limits: %w", err)
+	}
+	return nil
+}
+ 
+// ClearOrgLimits removes all limit overrides for an org, reverting to system defaults.
+func (s *Store) ClearOrgLimits(ctx context.Context, orgID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM org_limits WHERE org_id = $1`,
+		orgID,
+	)
+	return err
+}
+
 // MarkWalletSwept updates swept_at for a wallet (used by sweep worker).
 // func (s *Store) MarkWalletSwept(ctx context.Context, walletID string) error {
 // 	_, err := s.db.ExecContext(ctx,

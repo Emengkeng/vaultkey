@@ -129,7 +129,7 @@ func main() {
 	stablecoinH := handlers.NewStablecoinHandler(stablecoinSvc)
 	adminH := handlers.NewAdminHandler(registry)
 	sdkH := handlers.NewSDKHandler(
-		creditsMgr, store, walletSvc, q, rpcMgr, sweepSvc, stablecoinSvc,
+		cfg, creditsMgr, store, walletSvc, q, rpcMgr, sweepSvc, stablecoinSvc,
 	)
 	paymentH := handlers.NewPaymentHandler(store, creditsMgr, cfg)
 	usageH := handlers.NewUsageHandler(creditsMgr)
