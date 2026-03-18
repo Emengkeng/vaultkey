@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/vaultkey/vaultkey/config"
 	"github.com/vaultkey/vaultkey/internal/api/middleware"
 	"github.com/vaultkey/vaultkey/internal/queue"
 	"github.com/vaultkey/vaultkey/internal/rpc"
@@ -19,10 +20,11 @@ type Handler struct {
 	walletSvc *wallet.Service
 	queue     *queue.Queue
 	rpcMgr    *rpc.Manager
+	config *config.Config
 }
 
-func New(store *storage.Store, walletSvc *wallet.Service, q *queue.Queue, rpcMgr *rpc.Manager) *Handler {
-	return &Handler{store: store, walletSvc: walletSvc, queue: q, rpcMgr: rpcMgr}
+func New(store *storage.Store, walletSvc *wallet.Service, q *queue.Queue, rpcMgr *rpc.Manager, cfg *config.Config) *Handler {
+	return &Handler{store: store, walletSvc: walletSvc, queue: q, rpcMgr: rpcMgr, config: cfg}
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -57,11 +59,14 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 		maxRetries = req.MaxRetries
 	}
 
+	prefix := getKeyPrefix(h.config.Environment)
 	apiKey, err := generateToken(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	apiKey = prefix + apiKey
+
 	apiSecret, err := generateToken(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
@@ -86,6 +91,7 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	webhookSecret = prefix + webhookSecret
 
 	project, err := h.store.CreateProject(r.Context(), req.Name, apiKey, string(hash), webhookURL, &webhookSecret, rateLimitRPS, maxRetries)
 	if err != nil {
