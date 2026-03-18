@@ -27,6 +27,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/stablecoin"
 	"github.com/vaultkey/vaultkey/internal/storage"
 	"github.com/vaultkey/vaultkey/internal/sweep"
+	"github.com/vaultkey/vaultkey/internal/testclient"
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
 	"github.com/vaultkey/vaultkey/internal/worker"
@@ -305,33 +306,81 @@ func registerSDKRoutes(
 	limiter *ratelimit.Limiter,
 ) {
 	sdkAuth := middleware.SDKAuth(store, limiter, redisClient)
- 
 	sdkAuthed := func(fn http.HandlerFunc) http.Handler {
 		return sdkAuth(http.HandlerFunc(fn))
 	}
  
-	// ── Wallet operations ─────────────────────────────────────────────────
-	mux.Handle("POST /sdk/wallets",                   sdkAuthed(sdkH.CreateWallet))
-	mux.Handle("GET /sdk/wallets/{walletId}",         sdkAuthed(sdkH.GetWallet))
-	mux.Handle("GET /sdk/users/{userId}/wallets",     sdkAuthed(sdkH.ListUserWallets))
+	// Build registry — spec drives both the test client and route registration.
+	reg := testclient.NewRegistry()
+	specs := testclient.SDKRouteSpecs()
  
-	// ── Signing operations ────────────────────────────────────────────────
-	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/evm",    sdkAuthed(sdkH.SignEVMTransaction))
-	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/evm",        sdkAuthed(sdkH.SignEVMMessage))
-	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/solana", sdkAuthed(sdkH.SignSolanaTransaction))
-	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/solana",     sdkAuthed(sdkH.SignSolanaMessage))
+	// Helper: find spec by method+path, register route, return handler.
+	// The spec list in specs.go must stay in sync with the mux.Handle calls below.
+	// If a route has no spec, it still works — it just won't appear in the test client.
+	find := func(method, path string) testclient.RouteSpec {
+		for _, s := range specs {
+			if s.Method == method && s.Path == path {
+				return s
+			}
+		}
+		return testclient.RouteSpec{Method: method, Path: path, Name: path}
+	}
  
-	// ── Free operations ───────────────────────────────────────────────────
-	mux.Handle("GET /sdk/jobs/{jobId}",                         sdkAuthed(sdkH.GetJob))
-	mux.Handle("GET /sdk/wallets/{walletId}/balance",           sdkAuthed(sdkH.GetBalance))
-	mux.Handle("POST /sdk/wallets/{walletId}/broadcast",        sdkAuthed(sdkH.Broadcast))
+	// ── Wallet operations ─────────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets",
+		reg.Register(find("POST", "/sdk/wallets"), sdkAuthed(sdkH.CreateWallet)))
  
-	// ── Sweep ─────────────────────────────────────────────────────────────
-	mux.Handle("POST /sdk/wallets/{walletId}/sweep",            sdkAuthed(sdkH.TriggerSweep))
+	mux.Handle("GET /sdk/wallets/{walletId}",
+		reg.Register(find("GET", "/sdk/wallets/{walletId}"), sdkAuthed(sdkH.GetWallet)))
  
-	// ── Stablecoin ────────────────────────────────────────────────────────
-	mux.Handle("POST /sdk/wallets/{walletId}/stablecoin/transfer/{chainType}", sdkAuthed(sdkH.StablecoinTransfer))
-	mux.Handle("GET /sdk/wallets/{walletId}/stablecoin/balance/{chainType}",   sdkAuthed(sdkH.StablecoinBalance))
+	mux.Handle("GET /sdk/users/{userId}/wallets",
+		reg.Register(find("GET", "/sdk/users/{userId}/wallets"), sdkAuthed(sdkH.ListUserWallets)))
+ 
+	// ── Signing operations ────────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/evm",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/transaction/evm"),
+			sdkAuthed(sdkH.SignEVMTransaction)))
+ 
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/evm",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/message/evm"),
+			sdkAuthed(sdkH.SignEVMMessage)))
+ 
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/solana",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/transaction/solana"),
+			sdkAuthed(sdkH.SignSolanaTransaction)))
+ 
+	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/solana",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/message/solana"),
+			sdkAuthed(sdkH.SignSolanaMessage)))
+ 
+	// ── Free operations ───────────────────────────────────────────────────────
+	mux.Handle("GET /sdk/jobs/{jobId}",
+		reg.Register(find("GET", "/sdk/jobs/{jobId}"), sdkAuthed(sdkH.GetJob)))
+ 
+	mux.Handle("GET /sdk/wallets/{walletId}/balance",
+		reg.Register(find("GET", "/sdk/wallets/{walletId}/balance"), sdkAuthed(sdkH.GetBalance)))
+ 
+	mux.Handle("POST /sdk/wallets/{walletId}/broadcast",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/broadcast"), sdkAuthed(sdkH.Broadcast)))
+ 
+	// ── Sweep ─────────────────────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets/{walletId}/sweep",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/sweep"), sdkAuthed(sdkH.TriggerSweep)))
+ 
+	// ── Stablecoin ────────────────────────────────────────────────────────────
+	mux.Handle("POST /sdk/wallets/{walletId}/stablecoin/transfer/{chainType}",
+		reg.Register(find("POST", "/sdk/wallets/{walletId}/stablecoin/transfer/{chainType}"),
+			sdkAuthed(sdkH.StablecoinTransfer)))
+ 
+	mux.Handle("GET /sdk/wallets/{walletId}/stablecoin/balance/{chainType}",
+		reg.Register(find("GET", "/sdk/wallets/{walletId}/stablecoin/balance/{chainType}"),
+			sdkAuthed(sdkH.StablecoinBalance)))
+ 
+	// ── Mount test client (testnet / dev only) ────────────────────────────────
+	if testclient.Enabled() {
+		testclient.Mount(mux, reg)
+		log.Println("test client: mounted at /testclient (ENABLE_TEST_UI=true)")
+	}
  
 	log.Println("sdk routes: registered")
 }
