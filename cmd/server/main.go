@@ -124,7 +124,7 @@ func main() {
 	}()
 
 	// ── HTTP Handlers ─────────────────────────────────────────────────────────
-	h := handlers.New(store, walletSvc, q, rpcMgr)
+	h := handlers.New(store, walletSvc, q, rpcMgr, cfg)
 	relayerH := handlers.NewRelayerHandler(store, walletSvc, relayerSvc)
 	sweepH := handlers.NewSweepHandler(store, sweepSvc)
 	stablecoinH := handlers.NewStablecoinHandler(stablecoinSvc)
