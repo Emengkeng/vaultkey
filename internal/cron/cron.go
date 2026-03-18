@@ -2,25 +2,32 @@ package cron
 
 import (
 	"context"
+	"database/sql"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/vaultkey/vaultkey/internal/credits"
 )
 
-// FreeTierGrantAmount is the number of credits granted monthly to all orgs.
+// DefaultFreeTierGrantAmount is the number of credits granted monthly to all orgs.
 // Override with FREE_TIER_MONTHLY_CREDITS env var (use lower value on testnet).
 const DefaultFreeTierGrantAmount = int64(1000)
 
 // Runner runs background cron jobs.
 type Runner struct {
 	creditsMgr  *credits.Manager
+	db          *sql.DB
 	grantAmount int64
 }
 
-func New(creditsMgr *credits.Manager, grantAmount int64) *Runner {
+// New creates a new cron runner.
+// db is used only for migration readiness checks — credit operations
+// go through creditsMgr.
+func New(creditsMgr *credits.Manager, db *sql.DB, grantAmount int64) *Runner {
 	return &Runner{
 		creditsMgr:  creditsMgr,
+		db:          db,
 		grantAmount: grantAmount,
 	}
 }
@@ -50,10 +57,15 @@ func (cr *Runner) runFreeTierGrant(ctx context.Context) {
 	}
 }
 
-// runFreeTierGrantNow executes the free tier grant immediately.
-// Exported so it can be called on startup to backfill any missed months,
-// and from tests.
+// RunFreeTierGrantNow executes the free tier grant immediately.
+// Safe to call on startup — checks migration readiness before doing
+// anything and silently skips if tables are not yet present.
+// Exported for use in main.go startup and tests.
 func (cr *Runner) RunFreeTierGrantNow(ctx context.Context) {
+	if !cr.tablesReady(ctx) {
+		log.Println("cron: skipping free tier grant — credit tables not yet migrated")
+		return
+	}
 	cr.runFreeTierGrantNow(ctx)
 }
 
@@ -63,6 +75,10 @@ func (cr *Runner) runFreeTierGrantNow(ctx context.Context) {
 
 	orgIDs, err := cr.creditsMgr.ListOrgsForFreeGrant(ctx, period)
 	if err != nil {
+		if isMissingTableError(err) {
+			log.Printf("cron: skipping free tier grant — migration 003 not applied yet: %v", err)
+			return
+		}
 		log.Printf("cron: list orgs for free grant failed: %v", err)
 		return
 	}
@@ -79,7 +95,8 @@ func (cr *Runner) runFreeTierGrantNow(ctx context.Context) {
 	for _, orgID := range orgIDs {
 		select {
 		case <-ctx.Done():
-			log.Printf("cron: free tier grant interrupted after %d/%d orgs", succeeded, len(orgIDs))
+			log.Printf("cron: free tier grant interrupted after %d/%d orgs",
+				succeeded, len(orgIDs))
 			return
 		default:
 		}
@@ -97,10 +114,6 @@ func (cr *Runner) runFreeTierGrantNow(ctx context.Context) {
 }
 
 func (cr *Runner) grantToOrg(ctx context.Context, orgID, period string) error {
-	// MarkFreeGrantGiven uses INSERT ... ON CONFLICT DO NOTHING.
-	// If the row already exists (concurrent run or restart), this is a no-op.
-	// We check first to avoid crediting before marking, which would leave
-	// an orphaned credit if MarkFreeGrantGiven then fails.
 	already, err := cr.creditsMgr.HasReceivedFreeGrantThisMonth(ctx, orgID, period)
 	if err != nil {
 		return err
@@ -109,10 +122,6 @@ func (cr *Runner) grantToOrg(ctx context.Context, orgID, period string) error {
 		return nil
 	}
 
-	// Mark first, then credit.
-	// If credit fails after mark: org misses this month's grant.
-	// This is safer than the reverse (double credit risk).
-	// A monitoring alert on cron failures catches this edge case.
 	if err := cr.creditsMgr.MarkFreeGrantGiven(ctx, orgID, period); err != nil {
 		return err
 	}
@@ -129,10 +138,44 @@ func (cr *Runner) grantToOrg(ctx context.Context, orgID, period string) error {
 	})
 }
 
+// tablesReady checks whether migration 003 has been applied by probing
+// the three tables it creates. Returns false if any are missing.
+func (cr *Runner) tablesReady(ctx context.Context) bool {
+	tables := []string{
+		"free_tier_grants",
+		"org_credit_balance",
+		"credit_ledger",
+	}
+	for _, table := range tables {
+		var exists bool
+		err := cr.db.QueryRowContext(ctx,
+			`SELECT EXISTS (
+			     SELECT 1 FROM information_schema.tables
+			     WHERE table_schema = 'public'
+			       AND table_name   = $1
+			 )`,
+			table,
+		).Scan(&exists)
+		if err != nil || !exists {
+			return false
+		}
+	}
+	return true
+}
+
+// isMissingTableError returns true if the error is a Postgres
+// "relation does not exist" error (SQLSTATE 42P01).
+func isMissingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "42P01") ||
+		strings.Contains(s, "does not exist")
+}
+
 // nextMonthlyRun returns the next midnight UTC on the 1st of the month.
 func nextMonthlyRun() time.Time {
 	now := time.Now().UTC()
-	// First of next month at 00:00:00 UTC
-	next := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
-	return next
+	return time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
 }

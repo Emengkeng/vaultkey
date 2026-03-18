@@ -31,6 +31,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
 	"github.com/vaultkey/vaultkey/internal/worker"
+	"github.com/vaultkey/vaultkey/db"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 )
@@ -71,6 +72,16 @@ func main() {
 	}
 	defer store.Close()
 
+	// Runs before anything else — workers, HTTP server, cron.
+	// If migrations fail the server refuses to start.
+	// Safe to run on every startup — already-applied migrations are skipped.
+	migCtx, migCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer migCancel()
+ 
+	if err := db.Run(migCtx, store.DB()); err != nil {
+		log.Fatalf("migrations failed: %v", err)
+	}
+	
 	// ── Redis ─────────────────────────────────────────────────────────────────
 	q, err := queue.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
@@ -99,8 +110,8 @@ func main() {
 	registry := stablecoin.NewRegistry(store, redisClient)
 	stablecoinSvc := stablecoin.NewService(store, rpcMgr, q, registry)
 
-		// ── Cron (free tier grant) ────────────────────────────────────────────────
-	cronRunner := cron.New(creditsMgr, cfg.Cloud.FreeTier.MonthlyCredits)
+	// ── Cron (free tier grant) ────────────────────────────────────────────────
+	cronRunner := cron.New(creditsMgr, store.DB(), cfg.Cloud.FreeTier.MonthlyCredits)
 	go cronRunner.Start(ctx)
 
 	// Run immediately on startup to catch any missed grants (e.g. after downtime).
