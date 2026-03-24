@@ -31,7 +31,7 @@ import (
 	"github.com/vaultkey/vaultkey/internal/wallet"
 	"github.com/vaultkey/vaultkey/internal/webhook"
 	"github.com/vaultkey/vaultkey/internal/worker"
-	"github.com/vaultkey/vaultkey/db"
+	// "github.com/vaultkey/vaultkey/db"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 )
@@ -75,13 +75,13 @@ func main() {
 	// Runs before anything else — workers, HTTP server, cron.
 	// If migrations fail the server refuses to start.
 	// Safe to run on every startup — already-applied migrations are skipped.
-	migCtx, migCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer migCancel()
+	// migCtx, migCancel := context.WithTimeout(ctx, 60*time.Second)
+	// defer migCancel()
  
-	if err := db.Run(migCtx, store.DB()); err != nil {
-		log.Fatalf("migrations failed: %v", err)
-	}
-	
+	// if err := db.Run(migCtx, store.DB()); err != nil {
+	// 	log.Fatalf("migrations failed: %v", err)
+	// }
+
 	// ── Redis ─────────────────────────────────────────────────────────────────
 	q, err := queue.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
