@@ -348,17 +348,17 @@ func registerSDKRoutes(
 		reg.Register(find("GET", "/sdk/users/{userId}/wallets"), sdkAuthed(sdkH.ListUserWallets)))
  
 	// ── Signing operations ────────────────────────────────────────────────────
-	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/evm",
-		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/transaction/evm"),
-			sdkAuthed(sdkH.SignEVMTransaction)))
+	// mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/evm",
+	// 	reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/transaction/evm"),
+	// 		sdkAuthed(sdkH.SignEVMTransaction)))
  
 	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/evm",
 		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/message/evm"),
 			sdkAuthed(sdkH.SignEVMMessage)))
  
-	mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/solana",
-		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/transaction/solana"),
-			sdkAuthed(sdkH.SignSolanaTransaction)))
+	// mux.Handle("POST /sdk/wallets/{walletId}/sign/transaction/solana",
+	// 	reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/transaction/solana"),
+	// 		sdkAuthed(sdkH.SignSolanaTransaction)))
  
 	mux.Handle("POST /sdk/wallets/{walletId}/sign/message/solana",
 		reg.Register(find("POST", "/sdk/wallets/{walletId}/sign/message/solana"),
